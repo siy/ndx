@@ -322,4 +322,53 @@ impl Index {
         let table = txn.open_table(DOC_PATHS)?;
         Ok(table.len()?)
     }
+
+    pub fn list_all_with_meta(&self) -> Result<Vec<(String, FileEntry)>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILES)?;
+        let mut result = Vec::new();
+        for entry in table.range::<&str>(..)? {
+            let (key, val) = entry?;
+            let fe: FileEntry = serde_json::from_slice(val.value())?;
+            result.push((key.value().to_string(), fe));
+        }
+        Ok(result)
+    }
+
+    pub fn list_prefix_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileEntry)>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILES)?;
+        let mut result = Vec::new();
+        for entry in table.range(prefix..)? {
+            let (key, val) = entry?;
+            let k = key.value();
+            if !k.starts_with(prefix) {
+                break;
+            }
+            let fe: FileEntry = serde_json::from_slice(val.value())?;
+            result.push((k.to_string(), fe));
+        }
+        Ok(result)
+    }
+
+    /// Returns paths in FILES but not in PATH_IDS (non-content-indexed files).
+    /// Skips directories.
+    pub fn list_non_content_indexed(&self) -> Result<Vec<String>> {
+        let txn = self.db.begin_read()?;
+        let files_table = txn.open_table(FILES)?;
+        let path_ids_table = txn.open_table(PATH_IDS)?;
+        let mut result = Vec::new();
+        for entry in files_table.range::<&str>(..)? {
+            let (key, val) = entry?;
+            let path = key.value();
+            let fe: FileEntry = serde_json::from_slice(val.value())?;
+            if fe.is_dir {
+                continue;
+            }
+            if path_ids_table.get(path)?.is_none() {
+                result.push(path.to_string());
+            }
+        }
+        Ok(result)
+    }
 }
