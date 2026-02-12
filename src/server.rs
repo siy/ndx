@@ -49,37 +49,45 @@ pub struct SearchContentInput {
     pub max_results: Option<usize>,
 }
 
-/// Get candidate files for content search using trigram index when possible.
+/// Get candidate files with line hints for content search using trigram index.
 fn get_search_candidates(
     index: &Index,
     pattern: &str,
     file_pattern: Option<&str>,
-) -> Result<Vec<String>, anyhow::Error> {
+) -> Result<Vec<(String, Vec<u32>)>, anyhow::Error> {
     // Try to extract a literal from the pattern for trigram lookup
-    let files = match trigram::extract_longest_literal(pattern) {
-        Some(literal) => match index.search_trigram_candidates(literal)? {
+    let results = match trigram::extract_longest_literal(pattern) {
+        Some(literal) => match index.search_trigram(literal)? {
             Some(candidates) => candidates,
-            None => index.list_all()?, // literal too short for trigrams
+            None => all_files_no_lines(index)?, // literal too short for trigrams
         },
         None => {
             // No literals in regex — try the raw pattern itself
             // (works when pattern is a plain string with no metacharacters)
-            match index.search_trigram_candidates(pattern)? {
+            match index.search_trigram(pattern)? {
                 Some(candidates) => candidates,
-                None => index.list_all()?,
+                None => all_files_no_lines(index)?,
             }
         }
     };
 
     if let Some(fp) = file_pattern {
         let glob = Glob::new(fp)?.compile_matcher();
-        Ok(files
+        Ok(results
             .into_iter()
-            .filter(|p| glob.is_match(p.as_str()))
+            .filter(|(p, _)| glob.is_match(p.as_str()))
             .collect())
     } else {
-        Ok(files)
+        Ok(results)
     }
+}
+
+fn all_files_no_lines(index: &Index) -> Result<Vec<(String, Vec<u32>)>, anyhow::Error> {
+    Ok(index
+        .list_all()?
+        .into_iter()
+        .map(|p| (p, Vec::new()))
+        .collect())
 }
 
 #[rmcp::tool_router]
@@ -115,7 +123,7 @@ impl NdxServer {
         Ok(matched.into_iter().cloned().collect::<Vec<_>>().join("\n"))
     }
 
-    #[tool(description = "Search file contents by text or regex pattern. Uses trigram index for fast candidate filtering, then confirms with full regex match.")]
+    #[tool(description = "Search file contents by text or regex pattern. Uses trigram index for fast candidate filtering with line-level positions for literals, full regex match for patterns.")]
     async fn search_content(
         &self,
         params: Parameters<SearchContentInput>,
@@ -126,30 +134,80 @@ impl NdxServer {
         let max_results = params.0.max_results.unwrap_or(100);
 
         tokio::task::spawn_blocking(move || {
-            let matcher = RegexMatcher::new(&pattern).map_err(|e| e.to_string())?;
-            let mut searcher = Searcher::new();
-            let mut results: Vec<String> = Vec::new();
-
-            let files = get_search_candidates(&index, &pattern, file_pattern.as_deref())
+            let candidates = get_search_candidates(&index, &pattern, file_pattern.as_deref())
                 .map_err(|e| e.to_string())?;
 
-            for file_path in &files {
-                if results.len() >= max_results {
-                    break;
+            let mut results: Vec<String> = Vec::new();
+
+            if trigram::is_literal_pattern(&pattern) {
+                // Line-level matching for literal patterns
+                for (file_path, line_nums) in &candidates {
+                    if results.len() >= max_results {
+                        break;
+                    }
+                    let abs_path = index.abs_path(file_path);
+                    let content = match std::fs::read_to_string(&abs_path) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let lines: Vec<&str> = content.lines().collect();
+
+                    if line_nums.is_empty() {
+                        // No line hints (pattern too short for trigrams), scan all lines
+                        for (idx, line) in lines.iter().enumerate() {
+                            if results.len() >= max_results {
+                                break;
+                            }
+                            if line.contains(pattern.as_str()) {
+                                results.push(format!(
+                                    "{}:{}:{}",
+                                    file_path,
+                                    idx + 1,
+                                    line.trim_end()
+                                ));
+                            }
+                        }
+                    } else {
+                        // Check only candidate lines from trigram index
+                        for &line_num in line_nums {
+                            if results.len() >= max_results {
+                                break;
+                            }
+                            let idx = (line_num as usize).saturating_sub(1);
+                            if idx < lines.len() && lines[idx].contains(pattern.as_str()) {
+                                results.push(format!(
+                                    "{}:{}:{}",
+                                    file_path,
+                                    line_num,
+                                    lines[idx].trim_end()
+                                ));
+                            }
+                        }
+                    }
                 }
-                let abs_path = index.abs_path(file_path);
-                let fp = file_path.as_str();
-                let remaining = max_results - results.len();
-                let mut count = 0usize;
-                let _ = searcher.search_path(
-                    &matcher,
-                    &abs_path,
-                    UTF8(|lnum, line| {
-                        results.push(format!("{}:{}:{}", fp, lnum, line.trim_end()));
-                        count += 1;
-                        Ok(count < remaining)
-                    }),
-                );
+            } else {
+                // Regex matching — use grep on candidate files
+                let matcher = RegexMatcher::new(&pattern).map_err(|e| e.to_string())?;
+                let mut searcher = Searcher::new();
+
+                for (file_path, _) in &candidates {
+                    if results.len() >= max_results {
+                        break;
+                    }
+                    let abs_path = index.abs_path(file_path);
+                    let fp = file_path.as_str();
+                    let remaining = max_results - results.len();
+                    let mut count = 0usize;
+                    let _ = searcher.search_path(
+                        &matcher,
+                        &abs_path,
+                        UTF8(|lnum, line| {
+                            results.push(format!("{}:{}:{}", fp, lnum, line.trim_end()));
+                            count += 1;
+                            Ok(count < remaining)
+                        }),
+                    );
+                }
             }
 
             Ok(results.join("\n"))

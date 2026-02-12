@@ -1,15 +1,34 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-/// Extract unique trigrams from content bytes.
+/// A posting entry stores a (doc_id, line_num) pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PostingEntry {
+    pub doc_id: u32,
+    pub line_num: u32,
+}
+
+/// Extract trigrams with line-level positions from content bytes.
+/// Returns a map of trigram → sorted, deduplicated line numbers (1-based).
 /// Skips trigrams containing null bytes (binary indicator).
-pub fn extract_trigrams(content: &[u8]) -> HashSet<[u8; 3]> {
-    let mut set = HashSet::new();
-    for window in content.windows(3) {
-        if !window.contains(&0) {
-            set.insert([window[0], window[1], window[2]]);
+pub fn extract_trigrams_with_lines(content: &[u8]) -> HashMap<[u8; 3], Vec<u32>> {
+    let mut map: HashMap<[u8; 3], HashSet<u32>> = HashMap::new();
+    for (line_idx, line) in content.split(|&b| b == b'\n').enumerate() {
+        let line_num = (line_idx + 1) as u32;
+        for window in line.windows(3) {
+            if !window.contains(&0) {
+                map.entry([window[0], window[1], window[2]])
+                    .or_default()
+                    .insert(line_num);
+            }
         }
     }
-    set
+    map.into_iter()
+        .map(|(tri, lines)| {
+            let mut sorted: Vec<u32> = lines.into_iter().collect();
+            sorted.sort_unstable();
+            (tri, sorted)
+        })
+        .collect()
 }
 
 /// Extract trigrams from a search query string.
@@ -26,55 +45,80 @@ pub fn query_trigrams(query: &str) -> Option<Vec<[u8; 3]>> {
     Some(trigrams.into_iter().collect())
 }
 
-/// Encode a sorted list of doc IDs as packed little-endian u32 bytes.
-pub fn encode_posting_list(ids: &[u32]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(ids.len() * 4);
-    for &id in ids {
-        buf.extend_from_slice(&id.to_le_bytes());
+/// Encode a sorted list of posting entries as packed little-endian bytes.
+/// Each entry is 8 bytes: 4 for doc_id + 4 for line_num.
+pub fn encode_posting_list(entries: &[PostingEntry]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(entries.len() * 8);
+    for e in entries {
+        buf.extend_from_slice(&e.doc_id.to_le_bytes());
+        buf.extend_from_slice(&e.line_num.to_le_bytes());
     }
     buf
 }
 
-/// Decode packed little-endian u32 bytes into doc IDs.
-pub fn decode_posting_list(data: &[u8]) -> Vec<u32> {
-    data.chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+/// Decode packed little-endian bytes into posting entries.
+pub fn decode_posting_list(data: &[u8]) -> Vec<PostingEntry> {
+    data.chunks_exact(8)
+        .map(|c| PostingEntry {
+            doc_id: u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+            line_num: u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+        })
         .collect()
 }
 
-/// Intersect multiple sorted posting lists. Smallest-first for efficiency.
-pub fn intersect_posting_lists(lists: &[Vec<u32>]) -> Vec<u32> {
+/// Intersect multiple posting lists on doc_id, union line numbers per doc.
+/// Input lists must be sorted by (doc_id, line_num).
+pub fn intersect_posting_lists(lists: &[Vec<PostingEntry>]) -> Vec<PostingEntry> {
     if lists.is_empty() {
         return Vec::new();
     }
-    let mut sorted: Vec<&Vec<u32>> = lists.iter().collect();
-    sorted.sort_by_key(|l| l.len());
+    if lists.len() == 1 {
+        return lists[0].clone();
+    }
 
-    let mut result = sorted[0].clone();
-    for list in &sorted[1..] {
-        result = intersect_two(&result, list);
-        if result.is_empty() {
-            break;
+    // Build per-list maps of doc_id → line_nums
+    let maps: Vec<HashMap<u32, Vec<u32>>> = lists
+        .iter()
+        .map(|list| {
+            let mut m: HashMap<u32, Vec<u32>> = HashMap::new();
+            for e in list {
+                m.entry(e.doc_id).or_default().push(e.line_num);
+            }
+            m
+        })
+        .collect();
+
+    // Start with doc_ids from the smallest map
+    let mut sorted_indices: Vec<usize> = (0..maps.len()).collect();
+    sorted_indices.sort_by_key(|&i| maps[i].len());
+
+    let mut common_doc_ids: HashSet<u32> = maps[sorted_indices[0]].keys().copied().collect();
+    for &idx in &sorted_indices[1..] {
+        common_doc_ids.retain(|id| maps[idx].contains_key(id));
+        if common_doc_ids.is_empty() {
+            return Vec::new();
         }
     }
-    result
-}
 
-/// Intersect two sorted lists via merge.
-fn intersect_two(a: &[u32], b: &[u32]) -> Vec<u32> {
+    // For common doc_ids, union all line numbers
+    let mut doc_ids: Vec<u32> = common_doc_ids.into_iter().collect();
+    doc_ids.sort_unstable();
+
     let mut result = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                result.push(a[i]);
-                i += 1;
-                j += 1;
+    for doc_id in doc_ids {
+        let mut lines: HashSet<u32> = HashSet::new();
+        for map in &maps {
+            if let Some(line_nums) = map.get(&doc_id) {
+                lines.extend(line_nums);
             }
         }
+        let mut sorted_lines: Vec<u32> = lines.into_iter().collect();
+        sorted_lines.sort_unstable();
+        for line_num in sorted_lines {
+            result.push(PostingEntry { doc_id, line_num });
+        }
     }
+
     result
 }
 
@@ -94,4 +138,12 @@ pub fn extract_longest_literal(pattern: &str) -> Option<&str> {
         .split(|c: char| META.contains(&c))
         .filter(|s| s.len() >= 3)
         .max_by_key(|s| s.len())
+}
+
+/// Returns true if the pattern has no regex metacharacters (is a plain literal).
+pub fn is_literal_pattern(pattern: &str) -> bool {
+    const META: &[char] = &[
+        '.', '*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '^', '$', '\\',
+    ];
+    !pattern.chars().any(|c| META.contains(&c))
 }

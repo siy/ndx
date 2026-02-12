@@ -149,19 +149,22 @@ impl Index {
     /// Batch-index file contents (used by scanner). Builds per-chunk trigram map
     /// in memory, then merges into redb in a single transaction.
     pub fn index_content_batch(&self, files: &[(String, Vec<u8>)]) -> Result<()> {
-        let mut tri_map: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
+        let mut tri_map: HashMap<[u8; 3], Vec<trigram::PostingEntry>> = HashMap::new();
         let mut doc_entries: Vec<(u32, &str)> = Vec::new();
 
         for (path, content) in files {
             let doc_id = self.alloc_doc_id();
-            for tri in trigram::extract_trigrams(content) {
-                tri_map.entry(tri).or_default().push(doc_id);
+            for (tri, line_nums) in trigram::extract_trigrams_with_lines(content) {
+                let entries = tri_map.entry(tri).or_default();
+                for line_num in line_nums {
+                    entries.push(trigram::PostingEntry { doc_id, line_num });
+                }
             }
             doc_entries.push((doc_id, path.as_str()));
         }
 
-        for ids in tri_map.values_mut() {
-            ids.sort_unstable();
+        for entries in tri_map.values_mut() {
+            entries.sort_unstable();
         }
 
         let txn = self.db.begin_write()?;
@@ -175,15 +178,15 @@ impl Index {
                 path_ids.insert(path, doc_id)?;
             }
 
-            for (tri, new_ids) in &tri_map {
+            for (tri, new_entries) in &tri_map {
                 let encoded = match tri_table.get(tri.as_slice())? {
                     Some(existing) => {
-                        let mut ids = trigram::decode_posting_list(existing.value());
-                        ids.extend_from_slice(new_ids);
-                        ids.sort_unstable();
-                        trigram::encode_posting_list(&ids)
+                        let mut entries = trigram::decode_posting_list(existing.value());
+                        entries.extend_from_slice(new_entries);
+                        entries.sort_unstable();
+                        trigram::encode_posting_list(&entries)
                     }
-                    None => trigram::encode_posting_list(new_ids),
+                    None => trigram::encode_posting_list(new_entries),
                 };
                 tri_table.insert(tri.as_slice(), encoded.as_slice())?;
             }
@@ -200,7 +203,7 @@ impl Index {
             return Ok(());
         }
 
-        let tris = trigram::extract_trigrams(content);
+        let tri_lines = trigram::extract_trigrams_with_lines(content);
         let doc_id = self.alloc_doc_id();
 
         let txn = self.db.begin_write()?;
@@ -218,15 +221,18 @@ impl Index {
             doc_paths.insert(doc_id, rel_path)?;
             path_ids.insert(rel_path, doc_id)?;
 
-            for tri in &tris {
-                let mut ids = match tri_table.get(tri.as_slice())? {
+            for (tri, line_nums) in &tri_lines {
+                let mut entries = match tri_table.get(tri.as_slice())? {
                     Some(data) => trigram::decode_posting_list(data.value()),
                     None => Vec::new(),
                 };
-                if let Err(pos) = ids.binary_search(&doc_id) {
-                    ids.insert(pos, doc_id);
+                for &line_num in line_nums {
+                    let entry = trigram::PostingEntry { doc_id, line_num };
+                    if let Err(pos) = entries.binary_search(&entry) {
+                        entries.insert(pos, entry);
+                    }
                 }
-                let encoded = trigram::encode_posting_list(&ids);
+                let encoded = trigram::encode_posting_list(&entries);
                 tri_table.insert(tri.as_slice(), encoded.as_slice())?;
             }
         }
@@ -250,10 +256,10 @@ impl Index {
         Ok(())
     }
 
-    /// Search trigram index for candidate file paths matching a literal query.
+    /// Search trigram index for candidate file paths and line numbers.
     /// Returns None if query is too short for trigram lookup (caller falls back).
-    /// Returns Some(vec) with candidate paths (may be empty = no matches).
-    pub fn search_trigram_candidates(&self, query: &str) -> Result<Option<Vec<String>>> {
+    /// Returns Some(vec) with (path, line_nums) pairs (may be empty = no matches).
+    pub fn search_trigram(&self, query: &str) -> Result<Option<Vec<(String, Vec<u32>)>>> {
         let query_tris = match trigram::query_trigrams(query) {
             Some(tris) => tris,
             None => return Ok(None),
@@ -273,15 +279,36 @@ impl Index {
 
         let candidates = trigram::intersect_posting_lists(&lists);
 
-        // Resolve doc_ids to paths, filtering stale (tombstoned) entries
-        let mut paths = Vec::new();
-        for doc_id in candidates {
+        // Group by doc_id, resolve paths, filter stale (tombstoned) entries
+        let mut path_lines: Vec<(String, Vec<u32>)> = Vec::new();
+        let mut current_doc_id: Option<u32> = None;
+        let mut current_lines: Vec<u32> = Vec::new();
+
+        for entry in &candidates {
+            if current_doc_id == Some(entry.doc_id) {
+                current_lines.push(entry.line_num);
+            } else {
+                if let Some(doc_id) = current_doc_id {
+                    if let Some(path) = doc_paths_table.get(doc_id)? {
+                        path_lines.push((
+                            path.value().to_string(),
+                            std::mem::take(&mut current_lines),
+                        ));
+                    } else {
+                        current_lines.clear();
+                    }
+                }
+                current_doc_id = Some(entry.doc_id);
+                current_lines.push(entry.line_num);
+            }
+        }
+        if let Some(doc_id) = current_doc_id {
             if let Some(path) = doc_paths_table.get(doc_id)? {
-                paths.push(path.value().to_string());
+                path_lines.push((path.value().to_string(), current_lines));
             }
         }
 
-        Ok(Some(paths))
+        Ok(Some(path_lines))
     }
 
     pub fn trigram_count(&self) -> Result<u64> {
