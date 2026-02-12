@@ -1,5 +1,6 @@
 use crate::index::Index;
 use crate::trigram;
+use chrono::DateTime;
 use globset::Glob;
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
@@ -97,6 +98,12 @@ fn all_files_no_lines(index: &Index) -> Result<Vec<(String, Vec<u32>)>, anyhow::
         .into_iter()
         .map(|p| (p, Vec::new()))
         .collect())
+}
+
+fn format_modified(epoch_secs: u64) -> String {
+    DateTime::from_timestamp(epoch_secs as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| epoch_secs.to_string())
 }
 
 /// Format context lines around matches using grep-style output.
@@ -472,7 +479,7 @@ impl NdxServer {
 
             Ok(entries
                 .iter()
-                .map(|(p, e)| format!("{}\t{}", p, e.modified))
+                .map(|(p, e)| format!("{}\t{}", p, format_modified(e.modified)))
                 .collect::<Vec<_>>()
                 .join("\n"))
         } else {
@@ -518,7 +525,7 @@ impl NdxServer {
             matched.sort_by(|a, b| b.1.modified.cmp(&a.1.modified));
             Ok(matched
                 .iter()
-                .map(|(p, e)| format!("{}\t{}", p, e.modified))
+                .map(|(p, e)| format!("{}\t{}", p, format_modified(e.modified)))
                 .collect::<Vec<_>>()
                 .join("\n"))
         } else {
