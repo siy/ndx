@@ -187,20 +187,10 @@ async fn main() -> Result<()> {
     watcher::start_watcher(index.clone())?;
     tracing::info!("file watcher started");
 
-    // Open global memory database
+    // Open global memory database (don't scan yet — start MCP server first)
     let mem = match MemoryIndex::open() {
         Ok(m) => {
-            // Run initial memory scan
-            if let Err(e) = memory::session::scan_sessions(&m) {
-                tracing::warn!("session scan failed: {}", e);
-            }
-            if let Err(e) = memory::agent::scan_agents(&m) {
-                tracing::warn!("agent scan failed: {}", e);
-            }
-            if let Err(e) = memory::event::ingest_events(&m) {
-                tracing::warn!("event ingestion failed: {}", e);
-            }
-            tracing::info!("memory index loaded");
+            tracing::info!("memory database opened");
             Some(Arc::new(m))
         }
         Err(e) => {
@@ -209,13 +199,35 @@ async fn main() -> Result<()> {
         }
     };
 
-    let server = NdxServer::new(index, mem);
+    let server = NdxServer::new(index, mem.clone());
     let service = server
         .serve(rmcp::transport::io::stdio())
         .await
         .context("failed to start MCP server")?;
 
     tracing::info!("MCP server running on stdio");
+
+    // Run memory scan in background after MCP server is accepting requests
+    if let Some(ref m) = mem {
+        let m = m.clone();
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = memory::session::scan_sessions(&m) {
+                    tracing::warn!("session scan failed: {}", e);
+                }
+                if let Err(e) = memory::agent::scan_agents(&m) {
+                    tracing::warn!("agent scan failed: {}", e);
+                }
+                if let Err(e) = memory::event::ingest_events(&m) {
+                    tracing::warn!("event ingestion failed: {}", e);
+                }
+                tracing::info!("memory scan complete");
+            })
+            .await
+            .ok();
+        });
+    }
+
     service.waiting().await?;
 
     Ok(())
