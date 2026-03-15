@@ -1,4 +1,5 @@
 use crate::index::Index;
+use crate::memory::{self, MemoryIndex};
 use crate::trigram;
 use chrono::DateTime;
 use globset::Glob;
@@ -16,13 +17,15 @@ use std::sync::Arc;
 
 pub struct NdxServer {
     index: Arc<Index>,
+    memory: Option<Arc<MemoryIndex>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl NdxServer {
-    pub fn new(index: Arc<Index>) -> Self {
+    pub fn new(index: Arc<Index>, memory: Option<Arc<MemoryIndex>>) -> Self {
         Self {
             index,
+            memory,
             tool_router: Self::tool_router(),
         }
     }
@@ -62,6 +65,75 @@ pub struct SearchContentInput {
     pub output_mode: Option<String>,
     /// Skip first N results for pagination
     pub offset: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MemorySearchInput {
+    /// Text to search for in session transcripts
+    pub query: String,
+    /// Maximum number of results (default: 20)
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MemoryEventsSearchInput {
+    /// Text to search for in event commands
+    pub query: String,
+    /// Maximum number of results (default: 50)
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MemoryListInput {
+    /// Filter by project directory
+    pub project: Option<String>,
+    /// Maximum number of results (default: 20)
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MemoryStatsInput {}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MemorySessionDetailInput {
+    /// Session ID to look up
+    pub session_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MemoryProjectContextInput {
+    /// Project directory to get context for
+    pub project: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MemorySubagentSearchInput {
+    /// Text to search for in subagent transcripts
+    pub query: String,
+    /// Filter by parent session ID
+    pub parent_session_id: Option<String>,
+    /// Maximum number of results (default: 20)
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MemorySessionTreeInput {
+    /// Session ID to get the tree for
+    pub session_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FileSessionsInput {
+    /// File path to find sessions for
+    pub path: String,
+    /// Maximum number of results (default: 10)
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SessionFilesInput {
+    /// Session ID to list files for
+    pub session_id: String,
 }
 
 /// Get candidate files with line hints for content search using trigram index.
@@ -444,6 +516,71 @@ fn search_count_mode(
     Ok(counts.join("\n"))
 }
 
+// ── Memory formatting helpers ──
+
+fn format_session(s: &memory::SessionEntry) -> String {
+    let date = s.started_at.as_deref().unwrap_or("unknown");
+    let sid = if s.session_id.len() >= 8 {
+        &s.session_id[..8]
+    } else {
+        &s.session_id
+    };
+    let msg = s
+        .first_message
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .take(100)
+        .collect::<String>();
+    format!(
+        "{} | {} | {} | turns:{} tools:{} | {}",
+        date, s.project_dir, sid, s.turn_count, s.tool_call_count, msg
+    )
+}
+
+fn format_event(e: &memory::EventEntry) -> String {
+    let date = if e.event_ts.len() >= 16 {
+        &e.event_ts[..16]
+    } else {
+        &e.event_ts
+    };
+    let sid = if e.session_id.len() >= 8 {
+        &e.session_id[..8]
+    } else {
+        &e.session_id
+    };
+    let mk = e.manifest_key.as_deref().unwrap_or("-");
+    format!(
+        "{} | {} | {} | {} | {}",
+        date, e.project_dir, sid, mk, e.command
+    )
+}
+
+fn format_agent(a: &memory::AgentEntry) -> String {
+    let aid = if a.agent_id.len() >= 8 {
+        &a.agent_id[..8]
+    } else {
+        &a.agent_id
+    };
+    let pid = if a.parent_session_id.len() >= 8 {
+        &a.parent_session_id[..8]
+    } else {
+        &a.parent_session_id
+    };
+    let project = a.project_dir.as_deref().unwrap_or("-");
+    let msg = a
+        .first_message
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .take(100)
+        .collect::<String>();
+    format!(
+        "{} | parent:{} | {} | turns:{} tools:{} | {}",
+        aid, pid, project, a.turn_count, a.tool_call_count, msg
+    )
+}
+
 #[rmcp::tool_router]
 impl NdxServer {
     #[tool(description = "List indexed files, optionally filtered by directory prefix and/or glob pattern. Supports sorting by name or modification time.")]
@@ -584,7 +721,7 @@ impl NdxServer {
         .map_err(|e| e.to_string())?
     }
 
-    #[tool(description = "Show index statistics including trigram index info")]
+    #[tool(description = "Show index statistics including trigram index info and memory stats")]
     async fn index_status(&self) -> Result<String, String> {
         let file_count = self.index.count().map_err(|e| e.to_string())?;
         let content_count = self
@@ -593,10 +730,258 @@ impl NdxServer {
             .map_err(|e| e.to_string())?;
         let trigram_count = self.index.trigram_count().map_err(|e| e.to_string())?;
         let root = self.index.root().display().to_string();
-        Ok(format!(
+        let mut out = format!(
             "Project root: {}\nIndexed files: {}\nContent-indexed files: {}\nUnique trigrams: {}",
             root, file_count, content_count, trigram_count
-        ))
+        );
+
+        if let Some(ref mem) = self.memory {
+            match mem.session_stats() {
+                Ok(stats) => {
+                    out.push_str(&format!(
+                        "\n\nMemory:\n  Sessions: {}\n  Events: {}\n  Agents: {}\n  Total turns: {}\n  Total tool calls: {}",
+                        stats.session_count, stats.event_count, stats.agent_count,
+                        stats.total_turns, stats.total_tool_calls
+                    ));
+                    if let Some(ref oldest) = stats.oldest_session {
+                        out.push_str(&format!("\n  Oldest session: {}", oldest));
+                    }
+                    if let Some(ref newest) = stats.newest_session {
+                        out.push_str(&format!("\n  Newest session: {}", newest));
+                    }
+                }
+                Err(e) => {
+                    out.push_str(&format!("\n\nMemory: error loading stats: {}", e));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    #[tool(description = "Search session memory by text query. Returns sessions whose transcripts match the query.")]
+    async fn memory_search(
+        &self,
+        params: Parameters<MemorySearchInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        let limit = params.0.limit.unwrap_or(20);
+        let results = mem
+            .search_sessions(&params.0.query, limit)
+            .map_err(|e| e.to_string())?;
+        if results.is_empty() {
+            return Ok("No matching sessions found.".to_string());
+        }
+        Ok(results.iter().map(format_session).collect::<Vec<_>>().join("\n"))
+    }
+
+    #[tool(description = "Search event log (hooks, commands) by text query. Ingests new events first.")]
+    async fn memory_events_search(
+        &self,
+        params: Parameters<MemoryEventsSearchInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        // Ingest new events first
+        let _ = memory::event::ingest_events(mem);
+        let limit = params.0.limit.unwrap_or(50);
+        let results = mem
+            .search_events(&params.0.query, limit)
+            .map_err(|e| e.to_string())?;
+        if results.is_empty() {
+            return Ok("No matching events found.".to_string());
+        }
+        Ok(results.iter().map(format_event).collect::<Vec<_>>().join("\n"))
+    }
+
+    #[tool(description = "List recent sessions, optionally filtered by project directory.")]
+    async fn memory_list(
+        &self,
+        params: Parameters<MemoryListInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        let limit = params.0.limit.unwrap_or(20);
+        let results = mem
+            .list_sessions(params.0.project.as_deref(), limit)
+            .map_err(|e| e.to_string())?;
+        if results.is_empty() {
+            return Ok("No sessions found.".to_string());
+        }
+        Ok(results.iter().map(format_session).collect::<Vec<_>>().join("\n"))
+    }
+
+    #[tool(description = "Show memory statistics: session/event/agent counts, top tools, date range.")]
+    async fn memory_stats(
+        &self,
+        _params: Parameters<MemoryStatsInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        let stats = mem.session_stats().map_err(|e| e.to_string())?;
+        let mut out = format!(
+            "Sessions: {}\nEvents: {}\nAgents: {}\nTotal turns: {}\nTotal tool calls: {}",
+            stats.session_count, stats.event_count, stats.agent_count,
+            stats.total_turns, stats.total_tool_calls
+        );
+        if let Some(ref oldest) = stats.oldest_session {
+            out.push_str(&format!("\nOldest session: {}", oldest));
+        }
+        if let Some(ref newest) = stats.newest_session {
+            out.push_str(&format!("\nNewest session: {}", newest));
+        }
+        if !stats.top_tools.is_empty() {
+            out.push_str("\n\nTop tools:");
+            for (tool, count) in &stats.top_tools {
+                out.push_str(&format!("\n  {}: {}", tool, count));
+            }
+        }
+        Ok(out)
+    }
+
+    #[tool(description = "Get full details for a specific session by ID.")]
+    async fn memory_session_detail(
+        &self,
+        params: Parameters<MemorySessionDetailInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        let session = mem
+            .get_session(&params.0.session_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("session not found")?;
+        let mut out = format!(
+            "Session: {}\nProject: {}\nSlug: {}\nBranch: {}\nModel: {}\nStarted: {}\nEnded: {}\nTurns: {}\nTool calls: {}\nTools: {}\nFiles: {}\nFirst message: {}",
+            session.session_id,
+            session.project_dir,
+            session.slug,
+            session.git_branch.as_deref().unwrap_or("-"),
+            session.model.as_deref().unwrap_or("-"),
+            session.started_at.as_deref().unwrap_or("-"),
+            session.ended_at.as_deref().unwrap_or("-"),
+            session.turn_count,
+            session.tool_call_count,
+            session.tool_names.join(", "),
+            session.files.len(),
+            session.first_message.as_deref().unwrap_or("-"),
+        );
+        if !session.files.is_empty() {
+            out.push_str("\n\nFiles:");
+            for f in &session.files {
+                out.push_str(&format!("\n  {}", f));
+            }
+        }
+        Ok(out)
+    }
+
+    #[tool(description = "Get recent context for a project: last 5 sessions + last 20 events.")]
+    async fn memory_project_context(
+        &self,
+        params: Parameters<MemoryProjectContextInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        let project = params.0.project.as_deref();
+        let sessions = mem
+            .list_sessions(project, 5)
+            .map_err(|e| e.to_string())?;
+        let events = mem
+            .list_events(project, 20)
+            .map_err(|e| e.to_string())?;
+
+        let mut out = String::new();
+        out.push_str("Recent sessions:");
+        if sessions.is_empty() {
+            out.push_str("\n  (none)");
+        } else {
+            for s in &sessions {
+                out.push_str(&format!("\n  {}", format_session(s)));
+            }
+        }
+        out.push_str("\n\nRecent events:");
+        if events.is_empty() {
+            out.push_str("\n  (none)");
+        } else {
+            for e in &events {
+                out.push_str(&format!("\n  {}", format_event(e)));
+            }
+        }
+        Ok(out)
+    }
+
+    #[tool(description = "Search subagent transcripts by text query. Scans for new agents first.")]
+    async fn memory_subagent_search(
+        &self,
+        params: Parameters<MemorySubagentSearchInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        // Scan for new agents first
+        let _ = memory::agent::scan_agents(mem);
+        let limit = params.0.limit.unwrap_or(20);
+        let results = mem
+            .search_agents(&params.0.query, params.0.parent_session_id.as_deref(), limit)
+            .map_err(|e| e.to_string())?;
+        if results.is_empty() {
+            return Ok("No matching subagents found.".to_string());
+        }
+        Ok(results.iter().map(format_agent).collect::<Vec<_>>().join("\n"))
+    }
+
+    #[tool(description = "Show a session and its subagent tree.")]
+    async fn memory_session_tree(
+        &self,
+        params: Parameters<MemorySessionTreeInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        let session = mem
+            .get_session(&params.0.session_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("session not found")?;
+        let agents = mem
+            .list_agents_by_parent(&params.0.session_id)
+            .map_err(|e| e.to_string())?;
+
+        let mut out = format!("Session: {}", format_session(&session));
+        if agents.is_empty() {
+            out.push_str("\n\nNo subagents.");
+        } else {
+            out.push_str(&format!("\n\nSubagents ({}):", agents.len()));
+            for a in &agents {
+                out.push_str(&format!("\n  {}", format_agent(a)));
+            }
+        }
+        Ok(out)
+    }
+
+    #[tool(description = "Find sessions that touched a given file path.")]
+    async fn file_sessions(
+        &self,
+        params: Parameters<FileSessionsInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        let limit = params.0.limit.unwrap_or(10);
+        let results = mem
+            .sessions_for_file(&params.0.path, limit)
+            .map_err(|e| e.to_string())?;
+        if results.is_empty() {
+            return Ok("No sessions found for this file.".to_string());
+        }
+        Ok(results.iter().map(format_session).collect::<Vec<_>>().join("\n"))
+    }
+
+    #[tool(description = "List files touched by a session, with current status (exists/deleted).")]
+    async fn session_files(
+        &self,
+        params: Parameters<SessionFilesInput>,
+    ) -> Result<String, String> {
+        let mem = self.memory.as_ref().ok_or("memory not available")?;
+        let files = memory::xref::files_for_session_with_status(mem, &self.index, &params.0.session_id)
+            .map_err(|e| e.to_string())?;
+        if files.is_empty() {
+            return Ok("No files recorded for this session.".to_string());
+        }
+        let mut out = Vec::new();
+        for f in &files {
+            let size_str = f.size.map(|s| format!(" {}B", s)).unwrap_or_default();
+            let mod_str = f.modified.as_deref().unwrap_or("");
+            out.push(format!("{} [{}]{} {}", f.path, f.status, size_str, mod_str));
+        }
+        Ok(out.join("\n"))
     }
 }
 
@@ -615,7 +1000,7 @@ impl ServerHandler for NdxServer {
                 ..Default::default()
             },
             instructions: Some(
-                "File index server providing fast file listing and content search with trigram index."
+                "File index server with fast file listing, content search (trigram index), session memory, event hooks, and subagent tracking."
                     .to_string(),
             ),
         }
