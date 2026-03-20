@@ -1,8 +1,87 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MANIFEST_INDEX_URL: &str = "https://raw.githubusercontent.com/Cantara/kcp-commands/main/commands/index.txt";
 const MANIFEST_BASE_URL: &str = "https://raw.githubusercontent.com/Cantara/kcp-commands/main/commands";
+
+const SKILL_CONTENT: &str = r#"# ndx — Fast File Index & Memory Search
+
+Use the `ndx` CLI for trigram-accelerated file search, project file listing, session memory queries, and cross-referencing. ndx is available via Bash and works in all contexts including subagents.
+
+## When to use ndx
+
+- **Content search across many files** — faster than grep for large codebases due to trigram index
+- **Session memory** — find what was discussed or done in previous Claude Code sessions
+- **Cross-referencing** — find which sessions touched a file, or what files a session modified
+
+## File Index Commands
+
+All file index commands operate on the project in the current working directory. The first invocation scans and indexes the project (~100ms for 10K files).
+
+### Search file contents
+```bash
+ndx search <pattern>
+ndx search "TODO" --file-pattern "*.rs"
+ndx search "fn main" -B 2 -A 5
+ndx search "error" --output files        # just file names
+ndx search "import" --output count       # match counts per file
+ndx search "pattern" --max-results 50 --offset 100  # pagination
+```
+
+### List files
+```bash
+ndx list                                  # all indexed files
+ndx list --path src/                      # files under src/
+ndx list --pattern "*.rs"                 # filter by glob
+ndx list --sort modified                  # newest first
+```
+
+### Find files by glob
+```bash
+ndx find "**/*.toml"
+ndx find "src/**/*.rs" --sort modified
+```
+
+### Index status
+```bash
+ndx status
+```
+
+## Memory Commands
+
+Search and browse past Claude Code session transcripts and command events.
+
+```bash
+ndx memory search "database migration"          # search session transcripts
+ndx memory events "docker"                       # search command event log
+ndx memory list                                  # recent sessions
+ndx memory list --project /path/to/project       # filter by project
+ndx memory stats                                 # session/event/agent counts
+ndx memory session <session-id>                  # full session details
+ndx memory context                               # recent sessions + events for current project
+ndx memory context --project /path/to/project    # for a specific project
+ndx memory subagents "search query"              # search subagent transcripts
+ndx memory subagents "query" --parent <id>       # filter by parent session
+ndx memory tree <session-id>                     # session + subagent tree
+```
+
+All memory commands accept `--limit N` to control result count.
+
+## Cross-Reference Commands
+
+```bash
+ndx xref file src/main.rs                # find sessions that touched this file
+ndx xref session <session-id>            # list files touched by a session
+```
+
+## Maintenance
+
+```bash
+ndx scan              # re-scan project index + memory database
+ndx install           # download command manifests, register hook + skill
+ndx init              # install ndx skill into current project
+```
+"#;
 
 pub fn run_install() -> Result<()> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
@@ -20,16 +99,33 @@ pub fn run_install() -> Result<()> {
     let manifest_count = download_manifests(&commands_dir);
     eprintln!("  Manifests: {} files in {}", manifest_count, commands_dir.display());
 
-    // 3. Register MCP server + hook in ~/.claude/settings.json
+    // 3. Register hook in ~/.claude/settings.json (no MCP server)
     let settings_path = home.join(".claude").join("settings.json");
     register_claude_settings(&settings_path, &ndx_bin_str)?;
-    eprintln!("  MCP server: registered in {}", settings_path.display());
-    eprintln!("  Hook: PreToolUse Bash hook registered");
+    eprintln!("  Hook: PreToolUse Bash hook registered in {}", settings_path.display());
+
+    // 4. Install global skill
+    let skill_dir = home.join(".claude").join("commands");
+    install_skill(&skill_dir)?;
+    eprintln!("  Skill: installed to {}/ndx.md", skill_dir.display());
 
     eprintln!();
     eprintln!("ndx install complete");
     eprintln!("  Restart Claude Code to activate.");
 
+    Ok(())
+}
+
+/// Install the ndx skill into a specific project directory.
+pub fn install_skill_to_project(project_dir: &Path) -> Result<()> {
+    let skill_dir = project_dir.join(".claude").join("commands");
+    install_skill(&skill_dir)
+}
+
+fn install_skill(skill_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(skill_dir)?;
+    let skill_path = skill_dir.join("ndx.md");
+    std::fs::write(&skill_path, SKILL_CONTENT)?;
     Ok(())
 }
 
@@ -102,18 +198,13 @@ fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()
 
     let obj = settings.as_object_mut().context("settings must be an object")?;
 
-    // Register MCP server
-    let mcp_servers = obj
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}));
-    if let Some(servers) = mcp_servers.as_object_mut() {
-        servers.insert(
-            "ndx".to_string(),
-            serde_json::json!({
-                "command": ndx_bin,
-                "args": ["."]
-            }),
-        );
+    // Remove ndx MCP server if previously registered
+    if let Some(mcp_servers) = obj.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+        mcp_servers.remove("ndx");
+        // Remove mcpServers key entirely if empty
+        if mcp_servers.is_empty() {
+            obj.remove("mcpServers");
+        }
     }
 
     // Register PreToolUse hook
