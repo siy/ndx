@@ -1,5 +1,4 @@
 use super::MemoryIndex;
-use crate::index::Index;
 use anyhow::Result;
 use std::path::Path;
 
@@ -12,7 +11,7 @@ pub struct FileStatus {
 
 pub fn files_for_session_with_status(
     memory: &MemoryIndex,
-    index: &Index,
+    root: &Path,
     session_id: &str,
 ) -> Result<Vec<FileStatus>> {
     let files = memory.files_for_session(session_id)?;
@@ -22,7 +21,7 @@ pub fn files_for_session_with_status(
         let abs_path = if Path::new(&file_path).is_absolute() {
             std::path::PathBuf::from(&file_path)
         } else {
-            index.abs_path(&file_path)
+            root.join(&file_path)
         };
 
         if abs_path.exists() {
