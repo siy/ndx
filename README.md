@@ -1,17 +1,38 @@
 # ndx
 
-Persistent file index server via [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) with episodic memory and command hooks. Single Rust binary, zero external dependencies.
+Fast file index with trigram search, real-time file watching, episodic memory, and command hooks. Single Rust binary, zero external dependencies. Runs as a background daemon with a thin CLI client.
 
 ## Features
 
 - **Fast file listing** — indexed file tree with prefix and glob filtering
 - **Trigram content search** — line-level positions for literal queries, regex with trigram-accelerated candidate narrowing
-- **Real-time updates** — filesystem watcher re-indexes on create/modify/delete
+- **Real-time updates** — background daemon with filesystem watcher re-indexes on create/modify/delete
 - **Gitignore-aware** — respects `.gitignore` rules, rebuilds matcher on changes
 - **Episodic memory** — indexes AI coding session transcripts for full-text search across past sessions
 - **Command hooks** — PreToolUse hook injects CLI syntax hints and filters noisy output
 - **Cross-referencing** — bridges file index and session memory ("which sessions touched this file?")
+- **Subagent-friendly** — pure CLI interface works from any context, including Claude Code subagents and team members
 - **Zero configuration** — single binary, no JVM, no Node.js, no external services
+
+## Architecture
+
+ndx uses a daemon+client architecture:
+
+```
+CLI (ndx search/list/find/status)
+  └─ client ──UDS──► daemon (background process)
+                       ├─ index.redb (exclusive owner)
+                       ├─ scanner (initial full scan)
+                       ├─ watcher (real-time updates)
+                       └─ query engine (trigram search)
+
+CLI (ndx memory/xref)
+  └─ direct access ──► memory.redb
+```
+
+The daemon auto-starts on the first index query and stays alive until `ndx stop`. It owns the project index exclusively, keeps it current via filesystem watcher, and serves queries over a Unix domain socket (`.ndx/ndx.sock`).
+
+Memory commands access the global memory database directly — no daemon needed.
 
 ## Installation
 
@@ -28,7 +49,7 @@ cp target/release/ndx ~/.local/bin/
 
 ### Setup
 
-After building, run the installer to download command manifests and register with your MCP client:
+After building, run the installer to download command manifests and register the hook and skill:
 
 ```sh
 ndx install
@@ -36,8 +57,8 @@ ndx install
 
 This will:
 1. Download 289 YAML command manifests from [kcp-commands](https://github.com/Cantara/kcp-commands) to `~/.ndx/commands/`
-2. Register ndx as an MCP server in `~/.claude/settings.json`
-3. Register the PreToolUse Bash hook for command syntax injection
+2. Register the PreToolUse Bash hook in `~/.claude/settings.json`
+3. Install the ndx skill to `~/.claude/commands/ndx.md`
 
 ### Per-project setup
 
@@ -46,50 +67,70 @@ cd /path/to/your/project
 ndx init
 ```
 
-Creates `.mcp.json` with the ndx server configured. MCP clients pick it up automatically.
+Installs the ndx skill into the project's `.claude/commands/` directory.
 
 ## CLI
 
+### File index commands
+
+All file index commands communicate with the background daemon (auto-started on first use).
+
+```sh
+ndx search <pattern>                    # trigram-accelerated content search
+ndx search "TODO" --file-pattern "*.rs" # filter files by glob
+ndx search "fn main" -B 2 -A 5         # context lines before/after
+ndx search "error" --output files       # output mode: content, files, count
+ndx search "pattern" --offset 100       # pagination
+
+ndx list                                # list all indexed files
+ndx list --path src/ --pattern "*.rs"   # filter by prefix and glob
+ndx list --sort modified               # sort by modification time
+
+ndx find "**/*.toml"                    # find files matching glob
+ndx find "src/**/*.rs" --sort modified
+
+ndx status                              # index + memory statistics
 ```
-ndx [path]        Start MCP server for the given project root (default: .)
-ndx init [path]   Create .mcp.json in the given directory
-ndx hook          PreToolUse hook handler (reads stdin, writes stdout)
-ndx filter <key>  Output noise filter (reads stdin, writes stdout)
-ndx scan          Scan sessions, events, and agents
-ndx install       Download manifests, register MCP server + hook
-ndx help          Show help
+
+### Memory commands
+
+Direct access to the global memory database — no daemon needed.
+
+```sh
+ndx memory search "database migration"          # search session transcripts
+ndx memory events "docker"                       # search command event log
+ndx memory list                                  # recent sessions
+ndx memory list --project /path/to/project       # filter by project
+ndx memory stats                                 # session/event/agent counts
+ndx memory session <session-id>                  # full session details
+ndx memory context                               # recent project context
+ndx memory subagents "search query"              # search subagent transcripts
+ndx memory tree <session-id>                     # session + subagent tree
 ```
 
-## MCP Tools
+All memory commands accept `--limit N`.
 
-### File Index Tools
+### Cross-reference commands
 
-| Tool | Description |
-|------|-------------|
-| `list_files` | List indexed files with prefix/glob filtering and sorting |
-| `search_files` | Find files matching a glob pattern |
-| `search_content` | Trigram-accelerated content search with context lines, output modes, pagination |
-| `index_status` | Show index and memory statistics |
+```sh
+ndx xref file src/main.rs               # find sessions that touched this file
+ndx xref session <session-id>           # list files touched by a session
+```
 
-### Memory Tools
+### Daemon commands
 
-| Tool | Description |
-|------|-------------|
-| `memory_search` | Search past sessions by keyword using trigram full-text search |
-| `memory_events_search` | Search tool-call events across all projects |
-| `memory_list` | List recent sessions, optionally filtered by project |
-| `memory_stats` | Aggregate statistics (sessions, events, agents, top tools) |
-| `memory_session_detail` | Full content of a specific session |
-| `memory_project_context` | Recent sessions + events for current project (start-of-session context) |
-| `memory_subagent_search` | Search within subagent transcripts |
-| `memory_session_tree` | Parent session + child agents as a tree |
+```sh
+ndx ping                                # check if daemon is running
+ndx stop                                # stop the background daemon
+```
 
-### Cross-Reference Tools
+### Maintenance commands
 
-| Tool | Description |
-|------|-------------|
-| `file_sessions` | Find sessions that touched or discussed a given file |
-| `session_files` | List files touched by a session with current status |
+```sh
+ndx scan                                # scan memory (sessions, events, agents)
+ndx install                             # download manifests, register hook + skill
+ndx init [path]                         # install ndx skill into a project
+```
 
 ## Command Hook
 
@@ -111,31 +152,34 @@ ndx uses the same YAML manifest format as [kcp-commands](https://github.com/Cant
 
 ## How It Works
 
-1. On startup, ndx walks the project tree and builds a file metadata index plus trigram content index in [redb](https://github.com/cberner/redb)
-2. A filesystem watcher keeps the file index current
-3. The global memory database at `~/.ndx/memory.redb` indexes session transcripts from `~/.claude/projects/`
-4. Content search extracts trigrams from queries to narrow candidates before confirming matches
-5. The hook subcommand resolves manifests and responds in <20ms
+1. On first query, the daemon starts and walks the project tree, building a file metadata index plus trigram content index in [redb](https://github.com/cberner/redb)
+2. A filesystem watcher keeps the file index current in real-time
+3. CLI commands connect to the daemon via Unix domain socket for index queries
+4. The global memory database at `~/.ndx/memory.redb` indexes session transcripts from `~/.claude/projects/`
+5. Content search extracts trigrams from queries to narrow candidates before confirming matches
+6. The hook subcommand resolves manifests and responds in <20ms
 
 ## Data Storage
 
 | Database | Location | Contents |
 |----------|----------|----------|
 | Project index | `{project}/.ndx/index.redb` | File metadata, trigram content index |
+| Daemon socket | `{project}/.ndx/ndx.sock` | Unix domain socket for client-daemon IPC |
+| Daemon log | `{project}/.ndx/ndx.log` | Daemon stderr output |
 | Global memory | `~/.ndx/memory.redb` | Sessions, events, agents, cross-references |
 | Manifests | `~/.ndx/commands/*.yaml` | Command syntax and filter definitions |
 
 ## Environment Variables
 
-- `RUST_LOG` — control log verbosity (e.g. `RUST_LOG=ndx=debug`). Logs go to stderr.
+- `RUST_LOG` — control log verbosity (e.g. `RUST_LOG=ndx=debug`). Daemon logs go to `.ndx/ndx.log`.
 
 ## Acknowledgments
 
-ndx v0.2.0's episodic memory and command manifest features are inspired by and compatible with:
+ndx's episodic memory and command manifest features are inspired by and compatible with:
 
 - **[kcp-commands](https://github.com/Cantara/kcp-commands)** — Command syntax injection and output filtering for AI coding agents. Created by [Cantara](https://github.com/Cantara). ndx uses the same YAML manifest format and downloads the same bundled manifests (289 commands covering git, docker, kubectl, cloud CLIs, build tools, and more).
 
-- **[kcp-memory](https://github.com/Cantara/kcp-memory)** — Episodic memory daemon for AI coding sessions. Created by [Cantara](https://github.com/Cantara). ndx implements equivalent session transcript parsing and MCP tool interfaces in Rust.
+- **[kcp-memory](https://github.com/Cantara/kcp-memory)** — Episodic memory daemon for AI coding sessions. Created by [Cantara](https://github.com/Cantara). ndx implements equivalent session transcript parsing and CLI interfaces in Rust.
 
 - **[Knowledge Context Protocol](https://github.com/Cantara/knowledge-context-protocol)** — The KCP specification that defines the manifest format and integration patterns.
 
