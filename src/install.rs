@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MANIFEST_INDEX_URL: &str = "https://raw.githubusercontent.com/Cantara/kcp-commands/main/commands/index.txt";
 const MANIFEST_BASE_URL: &str = "https://raw.githubusercontent.com/Cantara/kcp-commands/main/commands";
@@ -130,56 +132,53 @@ fn install_skill(skill_dir: &Path) -> Result<()> {
 }
 
 fn download_manifests(commands_dir: &PathBuf) -> usize {
-    // Try to fetch index.txt to get list of manifest keys
-    let index_result = std::process::Command::new("curl")
-        .args(["-fsSL", "--connect-timeout", "10", MANIFEST_INDEX_URL])
-        .output();
-
-    let keys: Vec<String> = match index_result {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.trim().to_string())
-                .collect()
-        }
-        _ => {
-            eprintln!("  Warning: could not fetch manifest index. Try manually:");
-            eprintln!("    curl -fsSL {} > /tmp/index.txt", MANIFEST_INDEX_URL);
+    // Fetch index.txt with ureq
+    let index_body = match ureq::get(MANIFEST_INDEX_URL).call() {
+        Ok(resp) => match resp.into_string() {
+            Ok(body) => body,
+            Err(_) => {
+                eprintln!("  Warning: could not read manifest index body");
+                return 0;
+            }
+        },
+        Err(e) => {
+            eprintln!("  Warning: could not fetch manifest index: {}", e);
+            eprintln!("    URL: {}", MANIFEST_INDEX_URL);
             return 0;
         }
     };
 
-    let total = keys.len();
-    let mut downloaded = 0usize;
+    let keys: Vec<String> = index_body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .collect();
 
-    for (i, key) in keys.iter().enumerate() {
+    let total = keys.len();
+    let downloaded = AtomicUsize::new(0);
+    let progress = AtomicUsize::new(0);
+
+    // Parallel download with rayon
+    keys.par_iter().for_each(|key| {
         let url = format!("{}/{}.yaml", MANIFEST_BASE_URL, key);
         let dest = commands_dir.join(format!("{}.yaml", key));
 
-        let result = std::process::Command::new("curl")
-            .args(["-fsSL", "--connect-timeout", "5", "-o"])
-            .arg(&dest)
-            .arg(&url)
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                downloaded += 1;
-            }
-            _ => {
-                // Skip failures silently
+        if let Ok(resp) = ureq::get(&url).call() {
+            if let Ok(body) = resp.into_string() {
+                if std::fs::write(&dest, body).is_ok() {
+                    downloaded.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
-        // Progress indicator every 50
-        if (i + 1) % 50 == 0 || i + 1 == total {
-            eprint!("\r  Downloading: {}/{}", i + 1, total);
+        let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+        if done % 50 == 0 || done == total {
+            eprint!("\r  Downloading: {}/{}", done, total);
         }
-    }
+    });
     eprintln!();
 
-    downloaded
+    downloaded.load(Ordering::Relaxed)
 }
 
 fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()> {
