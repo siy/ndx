@@ -8,27 +8,24 @@ pub struct PostingEntry {
 }
 
 /// Extract trigrams with line-level positions from content bytes.
-/// Returns a map of trigram → sorted, deduplicated line numbers (1-based).
-/// Skips trigrams containing null bytes (binary indicator).
+/// Uses Vec with last-element dedup instead of HashSet — since lines are
+/// processed sequentially, duplicate line numbers are always consecutive.
+/// This halves memory usage for large files.
 pub fn extract_trigrams_with_lines(content: &[u8]) -> HashMap<[u8; 3], Vec<u32>> {
-    let mut map: HashMap<[u8; 3], HashSet<u32>> = HashMap::new();
+    let mut map: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
     for (line_idx, line) in content.split(|&b| b == b'\n').enumerate() {
         let line_num = (line_idx + 1) as u32;
         for window in line.windows(3) {
             if !window.contains(&0) {
-                map.entry([window[0], window[1], window[2]])
-                    .or_default()
-                    .insert(line_num);
+                let tri = [window[0], window[1], window[2]];
+                let vec = map.entry(tri).or_default();
+                if vec.last() != Some(&line_num) {
+                    vec.push(line_num);
+                }
             }
         }
     }
-    map.into_iter()
-        .map(|(tri, lines)| {
-            let mut sorted: Vec<u32> = lines.into_iter().collect();
-            sorted.sort_unstable();
-            (tri, sorted)
-        })
-        .collect()
+    map
 }
 
 /// Extract trigrams from a search query string.

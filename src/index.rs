@@ -2,7 +2,7 @@ use crate::trigram;
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -10,6 +10,8 @@ const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const TRIGRAMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("trigrams");
 const DOC_PATHS: TableDefinition<u32, &str> = TableDefinition::new("doc_paths");
 const PATH_IDS: TableDefinition<&str, u32> = TableDefinition::new("path_ids");
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const FILE_HASHES: TableDefinition<&str, &[u8]> = TableDefinition::new("file_hashes");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -35,11 +37,31 @@ impl Index {
         txn.open_table(TRIGRAMS)?;
         txn.open_table(DOC_PATHS)?;
         txn.open_table(PATH_IDS)?;
+        txn.open_table(META)?;
+        txn.open_table(FILE_HASHES)?;
         txn.commit()?;
+
+        // Restore next_doc_id from META
+        let next_id = {
+            let rtxn = db.begin_read()?;
+            let meta_table = rtxn.open_table(META)?;
+            match meta_table.get("next_doc_id")? {
+                Some(data) => {
+                    let bytes = data.value();
+                    if bytes.len() >= 4 {
+                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            }
+        };
+
         Ok(Self {
             db,
             root,
-            next_doc_id: AtomicU32::new(0),
+            next_doc_id: AtomicU32::new(next_id),
         })
     }
 
@@ -59,6 +81,97 @@ impl Index {
 
     pub fn abs_path(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
+    }
+
+    // ── META operations ──
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(META)?;
+        Ok(table.get(key)?.map(|v| v.value().to_vec()))
+    }
+
+    pub fn set_meta(&self, key: &str, value: &[u8]) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(META)?;
+            table.insert(key, value)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Persist current next_doc_id and last_scan_ts to META.
+    pub fn save_scan_state(&self) -> Result<()> {
+        let doc_id = self.next_doc_id.load(Ordering::Relaxed);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(META)?;
+            table.insert("next_doc_id", doc_id.to_le_bytes().as_slice())?;
+            table.insert("last_scan_ts", ts.to_le_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    // ── FILE_HASHES operations ──
+
+    pub fn get_file_hash(&self, path: &str) -> Result<Option<(u64, u64)>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILE_HASHES)?;
+        Ok(table.get(path)?.map(|v| {
+            let bytes = v.value();
+            let mtime = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            let size = u64::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]);
+            (mtime, size)
+        }))
+    }
+
+    pub fn set_file_hashes_batch(&self, entries: &[(String, u64, u64)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(FILE_HASHES)?;
+            for (path, mtime, size) in entries {
+                let mut buf = [0u8; 16];
+                buf[..8].copy_from_slice(&mtime.to_le_bytes());
+                buf[8..].copy_from_slice(&size.to_le_bytes());
+                table.insert(path.as_str(), buf.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Get all paths currently in FILE_HASHES with their (mtime, size).
+    pub fn get_all_file_hashes(&self) -> Result<HashMap<String, (u64, u64)>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILE_HASHES)?;
+        let mut result = HashMap::new();
+        for entry in table.range::<&str>(..)? {
+            let (key, val) = entry?;
+            let bytes = val.value();
+            let mtime = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            let size = u64::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]);
+            result.insert(key.value().to_string(), (mtime, size));
+        }
+        Ok(result)
     }
 
     // ── File metadata operations ──
@@ -97,6 +210,29 @@ impl Index {
         Ok(())
     }
 
+    /// Remove files from FILES, PATH_IDS, DOC_PATHS, and FILE_HASHES in one txn.
+    pub fn remove_files_batch(&self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut files_table = txn.open_table(FILES)?;
+            let mut path_ids = txn.open_table(PATH_IDS)?;
+            let mut doc_paths = txn.open_table(DOC_PATHS)?;
+            let mut file_hashes = txn.open_table(FILE_HASHES)?;
+            for path in paths {
+                files_table.remove(path.as_str())?;
+                file_hashes.remove(path.as_str())?;
+                if let Some(old_id) = path_ids.remove(path.as_str())? {
+                    doc_paths.remove(old_id.value())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn clear(&self) -> Result<()> {
         self.next_doc_id.store(0, Ordering::Relaxed);
         let txn = self.db.begin_write()?;
@@ -104,10 +240,14 @@ impl Index {
         txn.delete_table(TRIGRAMS)?;
         txn.delete_table(DOC_PATHS)?;
         txn.delete_table(PATH_IDS)?;
+        txn.delete_table(META)?;
+        txn.delete_table(FILE_HASHES)?;
         txn.open_table(FILES)?;
         txn.open_table(TRIGRAMS)?;
         txn.open_table(DOC_PATHS)?;
         txn.open_table(PATH_IDS)?;
+        txn.open_table(META)?;
+        txn.open_table(FILE_HASHES)?;
         txn.commit()?;
         Ok(())
     }
@@ -119,6 +259,18 @@ impl Index {
         for entry in table.range::<&str>(..)? {
             let (key, _) = entry?;
             paths.push(key.value().to_string());
+        }
+        Ok(paths)
+    }
+
+    /// Get all paths from FILES table as a HashSet.
+    pub fn get_all_indexed_paths(&self) -> Result<HashSet<String>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILES)?;
+        let mut paths = HashSet::new();
+        for entry in table.range::<&str>(..)? {
+            let (key, _) = entry?;
+            paths.insert(key.value().to_string());
         }
         Ok(paths)
     }
@@ -176,6 +328,66 @@ impl Index {
             for &(doc_id, path) in &doc_entries {
                 doc_paths.insert(doc_id, path)?;
                 path_ids.insert(path, doc_id)?;
+            }
+
+            for (tri, new_entries) in &tri_map {
+                let encoded = match tri_table.get(tri.as_slice())? {
+                    Some(existing) => {
+                        let mut entries = trigram::decode_posting_list(existing.value());
+                        entries.extend_from_slice(new_entries);
+                        entries.sort_unstable();
+                        trigram::encode_posting_list(&entries)
+                    }
+                    None => trigram::encode_posting_list(new_entries),
+                };
+                tri_table.insert(tri.as_slice(), encoded.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Batch-index pre-extracted trigram maps. Allocates doc_ids, tombstones old
+    /// entries, and merges posting lists in a single transaction.
+    pub fn index_content_batch_precomputed(
+        &self,
+        items: &[(String, HashMap<[u8; 3], Vec<u32>>)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut tri_map: HashMap<[u8; 3], Vec<trigram::PostingEntry>> = HashMap::new();
+        let mut doc_entries: Vec<(u32, String)> = Vec::new();
+
+        for (path, trigrams) in items {
+            let doc_id = self.alloc_doc_id();
+            for (tri, line_nums) in trigrams {
+                let entries = tri_map.entry(*tri).or_default();
+                for &line_num in line_nums {
+                    entries.push(trigram::PostingEntry { doc_id, line_num });
+                }
+            }
+            doc_entries.push((doc_id, path.clone()));
+        }
+
+        for entries in tri_map.values_mut() {
+            entries.sort_unstable();
+        }
+
+        let txn = self.db.begin_write()?;
+        {
+            let mut tri_table = txn.open_table(TRIGRAMS)?;
+            let mut doc_paths = txn.open_table(DOC_PATHS)?;
+            let mut path_ids = txn.open_table(PATH_IDS)?;
+
+            // Tombstone old doc_ids and insert new mappings
+            for (doc_id, path) in &doc_entries {
+                if let Some(old_id) = path_ids.remove(path.as_str())? {
+                    doc_paths.remove(old_id.value())?;
+                }
+                doc_paths.insert(*doc_id, path.as_str())?;
+                path_ids.insert(path.as_str(), *doc_id)?;
             }
 
             for (tri, new_entries) in &tri_map {
