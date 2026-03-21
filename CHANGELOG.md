@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.4.0 — Parallel Indexing & Incremental Scanning
+
+### Added
+- **Incremental scanning** — tracks mtime/size per file in FILE_HASHES table; only changed files are re-indexed on daemon restart
+- **Parallel trigram extraction** — rayon-based parallel content indexing (3-5x speedup on large projects)
+- **Watcher debouncing** — 200ms debounce window batches filesystem events into bulk transactions
+- **Parallel manifest downloads** — ureq + rayon replaces 289 sequential curl subprocesses (~20x faster)
+- **Doc ID persistence** — next_doc_id restored from META table across daemon restarts (no ID collisions)
+- **Batch file removal** — `remove_files_batch()` handles deletions in a single transaction
+- **Pre-computed trigram indexing** — `index_content_batch_precomputed()` accepts pre-extracted trigram maps for parallel pipelines
+
+### Changed
+- **Streaming trigram extraction** — replaced `HashSet<u32>` per trigram with `Vec<u32>` + last-element dedup (halves memory for large files)
+- **Scanner no longer calls `index.clear()`** — incremental diff instead of full rebuild
+- **Watcher processes events in batches** — 3 transactions per batch instead of N per-file transactions
+
+### Dependencies
+- Added `rayon = "1"` for data parallelism
+- Added `ureq = "2"` for HTTP (replaces curl subprocesses)
+
 ## v0.3.0 — CLI + Daemon Architecture
 
 **Breaking change:** ndx is no longer an MCP server. It is now a pure CLI tool backed by a background daemon.

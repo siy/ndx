@@ -22,8 +22,8 @@ ndx uses a daemon+client architecture:
 CLI (ndx search/list/find/status)
   └─ client ──UDS──► daemon (background process)
                        ├─ index.redb (exclusive owner)
-                       ├─ scanner (initial full scan)
-                       ├─ watcher (real-time updates)
+                       ├─ scanner (incremental parallel scan)
+                       ├─ watcher (debounced real-time updates)
                        └─ query engine (trigram search)
 
 CLI (ndx memory/xref)
@@ -152,8 +152,8 @@ ndx uses the same YAML manifest format as [kcp-commands](https://github.com/Cant
 
 ## How It Works
 
-1. On first query, the daemon starts and walks the project tree, building a file metadata index plus trigram content index in [redb](https://github.com/cberner/redb)
-2. A filesystem watcher keeps the file index current in real-time
+1. On first query, the daemon starts and walks the project tree, building a file metadata index plus trigram content index in [redb](https://github.com/cberner/redb). Subsequent startups are incremental — only changed files (by mtime/size) are re-indexed, with trigram extraction parallelized via rayon
+2. A debounced filesystem watcher batches events (200ms window) and processes them in bulk transactions
 3. CLI commands connect to the daemon via Unix domain socket for index queries
 4. The global memory database at `~/.ndx/memory.redb` indexes session transcripts from `~/.claude/projects/`
 5. Content search extracts trigrams from queries to narrow candidates before confirming matches
