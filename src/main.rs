@@ -4,6 +4,7 @@ mod hook;
 mod index;
 mod install;
 mod memory;
+mod recall;
 mod scanner;
 mod server;
 mod trigram;
@@ -11,6 +12,7 @@ mod watcher;
 
 use anyhow::{Context, Result};
 use memory::MemoryIndex;
+use recall::{ExitCode, Palace, RecallError};
 use std::path::PathBuf;
 
 fn print_usage() {
@@ -31,6 +33,12 @@ fn print_usage() {
     eprintln!("  ndx find <pattern>       Find files matching glob pattern");
     eprintln!("    --sort name|modified     Sort order (default: name)");
     eprintln!("  ndx status               Show index + memory statistics");
+    eprintln!();
+    eprintln!("Recall commands (per-project memory palace, direct access):");
+    eprintln!("  ndx recall init                 Create .ndx/recall.redb");
+    eprintln!("  ndx recall status [--json]      Palace statistics");
+    eprintln!("  ndx recall room <add|list|show|rm|rename>  Room management");
+    eprintln!("  ndx recall identity <show|edit> Identity (L0) file (TOML)");
     eprintln!();
     eprintln!("Memory commands (direct access, no daemon needed):");
     eprintln!("  ndx memory search <query>    Search session transcripts");
@@ -400,11 +408,293 @@ async fn cmd_daemon(root: PathBuf) -> Result<()> {
     daemon::run(root).await
 }
 
+// ── Recall commands (direct palace access) ──
+
+fn cmd_recall(args: &[String]) -> Result<()> {
+    let sub = args.first().map(|s| s.as_str());
+    let sub_args: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
+    match sub {
+        Some("init") => cmd_recall_init(),
+        Some("status") => cmd_recall_status(sub_args),
+        Some("room") => cmd_recall_room(sub_args),
+        Some("identity") => cmd_recall_identity(sub_args),
+        Some(other) => Err(RecallError::usage(format!(
+            "unknown recall subcommand `{}`. Run `ndx help` for usage.",
+            other
+        ))
+        .into()),
+        None => {
+            print_recall_usage();
+            Ok(())
+        }
+    }
+}
+
+fn print_recall_usage() {
+    eprintln!("ndx recall — per-project structured episodic memory palace");
+    eprintln!();
+    eprintln!("Palace lifecycle:");
+    eprintln!("  ndx recall init                 Create .ndx/recall.redb in current project");
+    eprintln!("  ndx recall status [--json]      Palace statistics");
+    eprintln!();
+    eprintln!("Rooms:");
+    eprintln!("  ndx recall room add <name> [--title T] [--description D]");
+    eprintln!("  ndx recall room list [--json]");
+    eprintln!("  ndx recall room show <name> [--json]");
+    eprintln!("  ndx recall room rm <name>");
+    eprintln!("  ndx recall room rename <old> <new>");
+    eprintln!();
+    eprintln!("Identity:");
+    eprintln!("  ndx recall identity show [--merged]");
+    eprintln!("  ndx recall identity edit [--project]");
+}
+
+fn cmd_recall_init() -> Result<()> {
+    let root = recall::current_project_root()?;
+    let _palace = Palace::create_at(root.clone())?;
+    eprintln!(
+        "recall palace initialized at {}/.ndx/recall.redb",
+        root.display()
+    );
+    Ok(())
+}
+
+fn cmd_recall_status(args: &[String]) -> Result<()> {
+    let palace = Palace::open_from_cwd()?;
+    let stats = palace.stats()?;
+    let json = args.iter().any(|a| a == "--json");
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+    println!("Recall palace: {}", palace.db_path().display());
+    println!("  Schema version: {}", stats.schema_version);
+    println!("  Drawers: {}", stats.drawer_count);
+    println!("  Rooms:   {}", stats.room_count);
+    println!("  Links:   {}", stats.link_count);
+    if let Some(model) = &stats.embedding_model {
+        println!("  Embedding model: {}", model);
+    } else {
+        println!("  Embedding model: (none — Phase 3)");
+    }
+    if let Some(ts) = stats.last_mined_at {
+        println!("  Last mined: {}", format_unix(ts));
+    }
+    if let Some(ts) = stats.created_at {
+        println!("  Created: {}", format_unix(ts));
+    }
+    Ok(())
+}
+
+fn cmd_recall_room(args: &[String]) -> Result<()> {
+    let sub = args.first().map(|s| s.as_str());
+    let sub_args: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
+    match sub {
+        Some("add") => {
+            let name = get_positional(sub_args, &["--title", "--description"])
+                .ok_or_else(|| {
+                    RecallError::usage("usage: ndx recall room add <name> [--title T] [--description D]")
+                })?;
+            let title = get_flag(sub_args, "--title").map(|s| s.to_string());
+            let description =
+                get_flag(sub_args, "--description").map(|s| s.to_string());
+            let palace = Palace::open_from_cwd()?;
+            let created = palace.ensure_room(name, title, description)?;
+            if created {
+                eprintln!("room `{}` created", name);
+            } else {
+                eprintln!("room `{}` already exists", name);
+            }
+            Ok(())
+        }
+        Some("list") => {
+            let palace = Palace::open_from_cwd()?;
+            let rooms = palace.list_rooms()?;
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", serde_json::to_string_pretty(&rooms)?);
+            } else if rooms.is_empty() {
+                println!("(no rooms)");
+            } else {
+                for r in &rooms {
+                    print!("{}", r.name);
+                    if let Some(t) = &r.title {
+                        print!("  [{}]", t);
+                    }
+                    println!();
+                    if let Some(d) = &r.description {
+                        println!("    {}", d);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let name = get_positional(sub_args, &[])
+                .ok_or_else(|| RecallError::usage("usage: ndx recall room show <name>"))?;
+            let palace = Palace::open_from_cwd()?;
+            let room = palace.get_room(name)?.ok_or_else(|| {
+                RecallError::constraint(format!("room `{}` not found", name))
+            })?;
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", serde_json::to_string_pretty(&room)?);
+            } else {
+                println!("name: {}", room.name);
+                if let Some(t) = &room.title {
+                    println!("title: {}", t);
+                }
+                if let Some(d) = &room.description {
+                    println!("description: {}", d);
+                }
+                println!("created_at: {}", format_unix(room.created_at));
+            }
+            Ok(())
+        }
+        Some("rm") => {
+            let name = get_positional(sub_args, &[])
+                .ok_or_else(|| RecallError::usage("usage: ndx recall room rm <name>"))?;
+            let palace = Palace::open_from_cwd()?;
+            palace.delete_room(name)?;
+            eprintln!("room `{}` removed", name);
+            Ok(())
+        }
+        Some("rename") => {
+            // Positional: old new
+            let positional: Vec<&str> = sub_args
+                .iter()
+                .filter(|s| !s.starts_with('-'))
+                .map(|s| s.as_str())
+                .collect();
+            if positional.len() < 2 {
+                return Err(
+                    RecallError::usage("usage: ndx recall room rename <old> <new>").into()
+                );
+            }
+            let palace = Palace::open_from_cwd()?;
+            let moved = palace.rename_room(positional[0], positional[1])?;
+            eprintln!(
+                "room `{}` renamed to `{}` ({} drawers moved)",
+                positional[0], positional[1], moved
+            );
+            Ok(())
+        }
+        Some(other) => Err(RecallError::usage(format!(
+            "unknown `recall room` subcommand `{}`",
+            other
+        ))
+        .into()),
+        None => Err(RecallError::usage("usage: ndx recall room <add|list|show|rm|rename>").into()),
+    }
+}
+
+fn cmd_recall_identity(args: &[String]) -> Result<()> {
+    let sub = args.first().map(|s| s.as_str());
+    let sub_args: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
+    match sub {
+        Some("show") => {
+            let merged_flag = sub_args.iter().any(|a| a == "--merged");
+            let root = Palace::find()?.unwrap_or(recall::current_project_root()?);
+            if merged_flag {
+                let merged = recall::identity::load_merged(&root)?;
+                let project_name = recall::project_name(&root);
+                println!(
+                    "{}",
+                    recall::identity::render_l0(merged.as_ref(), Some(&project_name))
+                );
+            } else {
+                let project_path = recall::identity::project_identity_path(&root);
+                let global_path = recall::identity::global_identity_path()?;
+                if project_path.exists() {
+                    println!("# {}", project_path.display());
+                    println!("{}", std::fs::read_to_string(&project_path)?);
+                } else if global_path.exists() {
+                    println!("# {}", global_path.display());
+                    println!("{}", std::fs::read_to_string(&global_path)?);
+                } else {
+                    println!(
+                        "(no identity file; run `ndx recall identity edit` to create {})",
+                        global_path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some("edit") => {
+            let per_project = sub_args.iter().any(|a| a == "--project");
+            let path = if per_project {
+                let root = recall::current_project_root()?;
+                let p = recall::identity::project_identity_path(&root);
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                p
+            } else {
+                let p = recall::identity::global_identity_path()?;
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                p
+            };
+            if !path.exists() {
+                std::fs::write(&path, recall::identity::template())?;
+                eprintln!("created template at {}", path.display());
+            }
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+            let status = std::process::Command::new(&editor).arg(&path).status();
+            match status {
+                Ok(s) if s.success() => Ok(()),
+                Ok(s) => Err(RecallError::new(
+                    ExitCode::Generic,
+                    format!("editor `{}` exited with status {}", editor, s),
+                )
+                .into()),
+                Err(e) => Err(RecallError::new(
+                    ExitCode::Generic,
+                    format!("failed to launch editor `{}`: {}", editor, e),
+                )
+                .into()),
+            }
+        }
+        Some(other) => Err(RecallError::usage(format!(
+            "unknown `recall identity` subcommand `{}`",
+            other
+        ))
+        .into()),
+        None => {
+            Err(RecallError::usage("usage: ndx recall identity <show|edit>").into())
+        }
+    }
+}
+
+fn format_unix(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| ts.to_string())
+}
+
 // ── Main ──
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn main() {
+    std::process::exit(run_main());
+}
 
+fn run_main() -> i32 {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = dispatch(&args);
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            if let Some(re) = e.downcast_ref::<RecallError>() {
+                eprintln!("{}", re.message);
+                re.code.as_i32()
+            } else {
+                eprintln!("Error: {:#}", e);
+                1
+            }
+        }
+    }
+}
+
+fn dispatch(args: &[String]) -> Result<()> {
     match args.first().map(|s| s.as_str()) {
         // Index commands (via daemon)
         Some("search") => cmd_search(&args[1..]),
@@ -414,6 +704,9 @@ fn main() -> Result<()> {
 
         // Memory commands (direct)
         Some("memory") => cmd_memory(&args[1..]),
+
+        // Recall commands (direct palace access)
+        Some("recall") => cmd_recall(&args[1..]),
 
         // Cross-reference commands (direct memory + filesystem)
         Some("xref") => cmd_xref(&args[1..]),

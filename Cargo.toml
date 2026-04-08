@@ -22,3 +22,8 @@ regex = "1"
 dirs = "6"
 rayon = "1"
 ureq = "2"
+blake3 = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

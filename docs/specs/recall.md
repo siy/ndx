@@ -775,3 +775,49 @@ answered questions get moved to the amendment log.)*
 description, rationale.)*
 
 - **2026-04-08** — Initial draft (Phase 0 start).
+
+- **2026-04-08** — Phase 1 delivered. Conformance check against
+  R-100..R-172, R-201, R-207, R-301..R-323, R-401, R-402, R-431..R-435,
+  R-441, R-442, R-480, R-1001..R-1003 completed. Core model, identity,
+  and Phase 1 CLI surface pass. 11 unit tests green. Deferrals recorded
+  below; none are silent divergences — each is an explicit scope boundary
+  for a later phase.
+
+- **2026-04-08 / Phase 1 / R-103** — The `content_hash` field on `Drawer`
+  is serialized as a hex `String` (64 chars, BLAKE3 hex) rather than a
+  raw `[u8; 32]` byte array. Rationale: drawer rows are stored as
+  `serde_json` bytes in the `DRAWERS` table; `[u8; 32]` serializes to a
+  32-element numeric array which is less readable on `ndx recall drawer
+  show --json` and wastes space compared to the hex string. The 32 bytes
+  of entropy are preserved. The `DRAWER_BY_HASH` index key is still the
+  raw 32-byte BLAKE3 digest for compact lookups. No behavioral change to
+  R-102 dedup.
+
+- **2026-04-08 / Phase 1 / R-124** — Link cascade on drawer deletion is
+  implemented in Phase 2 alongside the `ndx recall drawer rm` CLI. Phase 1
+  does not expose drawer deletion, so no divergence is observable.
+
+- **2026-04-08 / Phase 1 / R-151, R-152** — Insert-side population of
+  `file_drawer_xref` and `session_drawer_xref` is implemented.
+  Delete-side maintenance is implemented in Phase 2 with `drawer rm`.
+
+- **2026-04-08 / Phase 1 / R-401** — Embedding model download during
+  `ndx recall init` is deferred to Phase 3 when `fastembed` is added.
+  Phase 1 `init` is otherwise complete (palace creation, unclassified
+  room, idempotent). `ndx recall status` shows
+  `Embedding model: (none — Phase 3)` until then.
+
+- **2026-04-08 / Phase 1 / R-1002** — Structured JSON error envelopes
+  (`{"ok": false, "error": "...", "code": N}`) for `--json` commands
+  are deferred to Phase 6 when most `--json` surface arrives. Phase 1
+  only ships `status --json` and `room list --json`, neither of which
+  surfaces meaningful errors beyond "palace not initialized" (caught
+  before the JSON path). Human-readable error text is emitted on stderr
+  and the exit code is set correctly, so scripts can already distinguish
+  failure modes.
+
+- **2026-04-08 / Phase 1 / R-1003** — Explicit panic hook with a "please
+  report" footer and forced exit code 1 is deferred. Rust's default
+  panic behavior (exit code 101, panic message on stderr) is in effect.
+  No functional impact in Phase 1; no panic paths exist in the recall
+  code.
