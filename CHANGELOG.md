@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.5.0 — Recall: Structured Episodic Memory (in progress)
+
+### Added
+- **`ndx recall`** — per-project structured memory palace with rooms, drawers, and cross-references
+- **4-layer recall ladder** — L0 identity (TOML), L1 wake-up, L2 room-filtered retrieval, L3 hybrid search
+- **Hybrid semantic + lexical search** — fastembed `all-MiniLM-L6-v2` embeddings fused with trigram results via RRF
+- **Drawer mining** — `mine --from-memory` (derives drawers from global session memory), `mine --from-chroma` (imports mempalace ChromaDB), `mine --project` (scans project files)
+- **Cross-references** — `xref drawer <file>`, `xref drawer-session <id>`, `xref git <commit>`
+- **Claude Code classification skills** — `/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`, `/ndx-recall-summarize` delegate judgment to Claude via CLI round-trip
+- **Hook wake-up injection** — PreToolUse hook injects L0+L1 context once per Claude session
+
+### Dependencies
+- Added `fastembed` for local MiniLM-L6-v2 embeddings (via `ort` / onnxruntime)
+- Added `toml` for identity file parsing
+- Added `rusqlite` for direct mempalace ChromaDB import
+
 ## v0.4.0 — Parallel Indexing & Incremental Scanning
 
 ### Added
