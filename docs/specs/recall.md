@@ -990,6 +990,46 @@ description, rationale.)*
   drawer/room/identity CRUD, xref). Adding a future skill is
   now a one-line change.
 
+- **2026-04-09** — Phase 7 delivered. Polish pass complete.
+  README.md extended with a full Recall palace section
+  (lifecycle, mining, retrieval ladder, drawer CRUD, rooms/
+  identity, Claude-curated skills) plus an updated architecture
+  diagram and data-storage table. CHANGELOG.md 0.5.0 entry
+  rewritten with the final phase-by-phase delivery summary and
+  explicit non-goals. Mempalace acknowledged in README.
+  Release build (`cargo build --release`) completed cleanly;
+  34/34 tests green. End-to-end walkthrough on the release
+  binary exercised init → mine → status --json → semantic
+  search (with verified synonym win: query "horizontal
+  scaling choice" resolved to "stateless horizontal scaling"
+  at sim=0.417) → drawer add/xref/pending-op fetch → JSON
+  error envelope (exit code 4 with structured stdout payload)
+  → install round-trip (6 files).
+
+- **2026-04-09 / Phase 7 / R-1002 closed** — Structured JSON
+  error envelopes now ship for every `--json` command. When
+  any command exits with a non-zero status and `--json` is
+  present anywhere in its argv, the error is routed to stdout
+  as `{"ok": false, "error": "...", "code": N}` instead of a
+  free-form stderr message. Both `RecallError` and generic
+  `anyhow::Error` paths handled in `run_main`. This retires
+  the Phase 1 deferral of R-1002 and completes the Phase 6
+  partial closure. Verified: `ndx recall status --json` run
+  outside a palace emits
+  `{"code":4,"error":"palace not initialized; run \`ndx recall init\`","ok":false}`
+  with exit code 4.
+
+- **2026-04-09 / Release sign-off** — Branch `release-0.5.0` is
+  ready for merge. Every spec requirement has been delivered or
+  explicitly deferred with rationale. Deferrals remaining:
+  R-502 (identity oversize warning — low value polish), R-702
+  (pending-op cursor pagination — not needed at target scale),
+  R-1003 (custom panic hook footer — cosmetic), R-613 Phase 2
+  clause (chroma embedding preservation — blocked on hnswlib
+  binding effort, re-embed covers the use case). None are
+  release blockers; each is documented above. Recommend merge
+  via the usual `release` skill flow.
+
 - **2026-04-09 / Phase 5 / R-805 interpretation** — The spec text
   for R-805 says "clears the current session's wake_injected
   entry". A plain `ndx recall wake --force` at a shell has no

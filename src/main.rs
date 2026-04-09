@@ -1298,15 +1298,35 @@ fn main() {
 
 fn run_main() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let json_mode = args.iter().any(|a| a == "--json");
     let result = dispatch(&args);
     match result {
         Ok(()) => 0,
         Err(e) => {
             if let Some(re) = e.downcast_ref::<RecallError>() {
-                eprintln!("{}", re.message);
+                if json_mode {
+                    // R-1002: structured error envelope on stdout.
+                    let payload = serde_json::json!({
+                        "ok": false,
+                        "error": re.message,
+                        "code": re.code.as_i32(),
+                    });
+                    println!("{}", payload);
+                } else {
+                    eprintln!("{}", re.message);
+                }
                 re.code.as_i32()
             } else {
-                eprintln!("Error: {:#}", e);
+                if json_mode {
+                    let payload = serde_json::json!({
+                        "ok": false,
+                        "error": format!("{:#}", e),
+                        "code": 1,
+                    });
+                    println!("{}", payload);
+                } else {
+                    eprintln!("Error: {:#}", e);
+                }
                 1
             }
         }

@@ -1,20 +1,56 @@
 # Changelog
 
-## v0.5.0 — Recall: Structured Episodic Memory (in progress)
+## v0.5.0 — Recall: Structured Episodic Memory Palace
+
+Released 2026-04-09. Design spec: [`docs/specs/recall.md`](docs/specs/recall.md).
 
 ### Added
-- **`ndx recall`** — per-project structured memory palace with rooms, drawers, and cross-references
-- **4-layer recall ladder** — L0 identity (TOML), L1 wake-up, L2 room-filtered retrieval, L3 hybrid search
-- **Hybrid semantic + lexical search** — fastembed `all-MiniLM-L6-v2` embeddings fused with trigram results via RRF
-- **Drawer mining** — `mine --from-memory` (derives drawers from global session memory), `mine --from-chroma` (imports mempalace ChromaDB), `mine --project` (scans project files)
-- **Cross-references** — `xref drawer <file>`, `xref drawer-session <id>`, `xref git <commit>`
-- **Claude Code classification skills** — `/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`, `/ndx-recall-summarize` delegate judgment to Claude via CLI round-trip
-- **Hook wake-up injection** — PreToolUse hook injects L0+L1 context once per Claude session
+
+#### Recall palace (`ndx recall`)
+- **Per-project structured memory** at `{project}/.ndx/recall.redb` with drawers (atomic memory units), rooms (topic buckets), and typed links (`references`, `contradicts`, `supersedes`, `derived_from`)
+- **BLAKE3 content-hash dedup** — repeat ingests bump importance on the existing drawer instead of creating duplicates
+- **4-layer retrieval ladder:**
+  - **L0** — identity text rendered from global `~/.ndx/identity.toml` deep-merged with optional per-project override
+  - **L1** — importance-ranked, room-grouped wake-up text (top 15 drawers, ≤3200 chars, excludes `Supersedes` targets)
+  - **L2** — room-filtered retrieval via `ndx recall get --room <name>`
+  - **L3** — hybrid search: fastembed `all-MiniLM-L6-v2` cosine (K_sem=50) fused with trigram intersection (K_lex=50) via Reciprocal Rank Fusion (k=60)
+- **Three mining modes:** `mine --from-memory` (turn-pair drawers from global session history filtered by current project), `mine --from-chroma <path>` (direct sqlite read of a mempalace ChromaDB export), `mine --project [--path]` (walks the project tree and paragraph-chunks text files)
+- **Full drawer CRUD** — `drawer add|list|show|update|rm|link|unlink` with cascade on delete across all satellite tables
+- **Claude-curated maintenance via slash commands** — `/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`, `/ndx-recall-summarize` delegate judgment to Claude Code and round-trip through `ndx recall drawer` CLI
+- **Pending-op read schema** — `drawer list --pending <op> --json` emits `{op, project, drawers, cursor}` for skill batch consumption
+- **Structured JSON write-back envelopes** — all `--json` write commands emit `{"ok": bool, ...}` on stdout; JSON error envelopes emit `{"ok": false, "error": ..., "code": N}` with the correct exit code
+
+#### Cross-references
+- `ndx xref drawer <file>` — resolves file paths to drawers via direct `source_file` match plus trigram-narrowed basename substring confirm
+- `ndx xref drawer-session <session-id>` — drawers derived from a session
+- `ndx xref git <commit>` — walks `git diff-tree` for the commit, unions drawer sets across changed files, caches the result (passive, no git hooks installed)
+
+#### Hook wake-up injection
+- PreToolUse Bash hook injects L0+L1 wake-up text exactly once per Claude session, wrapped in a `# ndx-recall wake-up (session ...)` marker block
+- Soft-fails at every decision point (no session id, no cwd, no palace, embedder error) so existing manifest-hint behavior is unaffected
+- `ndx recall wake --force` clears all session markers so the next Bash hook re-injects (picks up `identity.toml` edits, for example)
+
+#### Skills and installation
+- `ndx install` now drops 6 skill files (main `ndx.md` + 5 recall slash commands) to `~/.claude/commands/`
+- `ndx init <path>` drops the same 6 files to `<path>/.claude/commands/`
+- Main `ndx.md` rewritten with full recall surface documentation
 
 ### Dependencies
-- Added `fastembed` for local MiniLM-L6-v2 embeddings (via `ort` / onnxruntime)
-- Added `toml` for identity file parsing
-- Added `rusqlite` for direct mempalace ChromaDB import
+- Added `fastembed = "4"` for local MiniLM-L6-v2 embeddings (pulls `ort` / onnxruntime)
+- Added `toml = "0.8"` for identity file parsing
+- Added `rusqlite = "0.32"` (bundled) for direct mempalace ChromaDB read
+- Added `blake3 = "1"` for content hashing
+
+### Deliberate non-goals
+- No AAAK compression layer (mempalace's lossy dialect; benchmark regression)
+- No MCP server (ndx is pure CLI, subagent-friendly by construction)
+- No ChromaDB runtime dependency (only read-only import)
+- No global cross-project palace in v1 (identity is global, drawers are strictly per-project)
+- No pre-commit git hooks (cross-ref is on-demand only)
+- No heuristic NLP in Rust (classification/scoring/dedup/contradict/summarize all delegate to Claude via skills)
+
+### Migration notes
+This is a pure addition: all existing file-index, memory, xref, and hook behaviors are preserved. The file-index daemon and `~/.ndx/memory.redb` are unchanged. Recall palaces are opt-in via `ndx recall init`.
 
 ## v0.4.0 — Parallel Indexing & Incremental Scanning
 
