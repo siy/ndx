@@ -908,6 +908,66 @@ impl Palace {
         Ok(out)
     }
 
+    // ── Wake-up injection state (Phase 5 / R-160 series) ──
+
+    /// Return true if wake-up text has already been injected into the
+    /// given Claude session.
+    pub fn wake_injection_seen(&self, session_id: &str) -> Result<bool> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(WAKE_INJECTED)?;
+        Ok(tbl.get(session_id)?.is_some())
+    }
+
+    /// Mark the given session as having received wake-up injection.
+    /// Idempotent — repeat calls simply refresh the timestamp.
+    pub fn mark_wake_injected(&self, session_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tbl = txn.open_table(WAKE_INJECTED)?;
+            tbl.insert(session_id, now_unix() as u64)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Clear the wake-up injection marker for a specific session.
+    pub fn clear_wake_injection(&self, session_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed: bool;
+        {
+            let mut tbl = txn.open_table(WAKE_INJECTED)?;
+            existed = tbl.remove(session_id)?.is_some();
+        }
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Clear all wake-up injection markers. Used by `wake --force` when
+    /// the caller has no session id in scope (e.g., user running the
+    /// command at a plain shell to pick up identity.toml edits).
+    pub fn clear_all_wake_injections(&self) -> Result<u64> {
+        let txn = self.db.begin_write()?;
+        let cleared: u64;
+        {
+            let mut tbl = txn.open_table(WAKE_INJECTED)?;
+            let keys: Vec<String> = {
+                let iter = tbl.iter()?;
+                let mut out = Vec::new();
+                for entry in iter {
+                    let (k, _) = entry?;
+                    out.push(k.value().to_string());
+                }
+                out
+            };
+            cleared = keys.len() as u64;
+            for k in keys {
+                tbl.remove(k.as_str())?;
+            }
+        }
+        txn.commit()?;
+        Ok(cleared)
+    }
+
     /// Create (or update) a link between two drawers. Idempotent: a
     /// repeat call with the same `(from, to, kind)` is a no-op.
     pub fn link_drawers(&self, from: u64, to: u64, kind: LinkKind) -> Result<()> {
@@ -1499,6 +1559,29 @@ mod tests {
         assert_eq!(hits[0].importance, 9);
         assert_eq!(hits[1].importance, 7);
         assert_eq!(hits[2].importance, 3);
+    }
+
+    #[test]
+    fn wake_injection_state_round_trip() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        assert!(!p.wake_injection_seen("sess-1").unwrap());
+        p.mark_wake_injected("sess-1").unwrap();
+        assert!(p.wake_injection_seen("sess-1").unwrap());
+        // Repeat mark is idempotent.
+        p.mark_wake_injected("sess-1").unwrap();
+        assert!(p.wake_injection_seen("sess-1").unwrap());
+        // Second session unaffected.
+        assert!(!p.wake_injection_seen("sess-2").unwrap());
+        // Clearing specific session works.
+        assert!(p.clear_wake_injection("sess-1").unwrap());
+        assert!(!p.wake_injection_seen("sess-1").unwrap());
+        // Clear-all on empty table is a no-op.
+        p.mark_wake_injected("sess-1").unwrap();
+        p.mark_wake_injected("sess-2").unwrap();
+        assert_eq!(p.clear_all_wake_injections().unwrap(), 2);
+        assert!(!p.wake_injection_seen("sess-1").unwrap());
+        assert!(!p.wake_injection_seen("sess-2").unwrap());
     }
 
     #[test]

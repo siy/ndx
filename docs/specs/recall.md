@@ -920,3 +920,29 @@ description, rationale.)*
   per R-102 but surfaces a data-quality concern that the Phase 6
   `/ndx-recall-score` skill will mitigate by letting Claude
   downgrade noise drawers. No code change needed in Phase 4.
+
+- **2026-04-09** — Phase 5 delivered. Conformance check against
+  R-160..R-162, R-800..R-805 completed. Wake-up injection threads
+  through the existing `ndx hook` Bash handler, wraps the L0+L1
+  text in a `# ndx-recall wake-up (session …)` marker block, and
+  prepends it to `additionalContext` exactly once per Claude
+  session. Soft-fails at every decision point (no session id,
+  no cwd, no palace, embedder failure) so the existing manifest
+  hint path is unaffected. End-to-end smoke test verified:
+  1st hook ships wake-up (2490 chars), 2nd hook same session
+  omits it (637 chars), `wake --force` clears the marker,
+  3rd hook re-injects, and a no-palace cwd silently emits only
+  the manifest hints. 24 unit tests green.
+
+- **2026-04-09 / Phase 5 / R-805 interpretation** — The spec text
+  for R-805 says "clears the current session's wake_injected
+  entry". A plain `ndx recall wake --force` at a shell has no
+  "current session" — Claude Code does not export
+  `CLAUDE_SESSION_ID` to child processes, and the command has
+  no other way to learn it. Adopted interpretation: `--force`
+  clears **all** injection markers. Rationale: the concrete use
+  case is "I edited identity.toml, I want the next Bash hook in
+  every active session to pick up the change", which is exactly
+  what clear-all delivers. A narrower `--force --session <id>`
+  form can be added later without a spec rewrite if clear-all
+  proves too coarse.

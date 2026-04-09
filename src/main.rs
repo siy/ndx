@@ -371,18 +371,33 @@ fn cmd_hook() -> Result<()> {
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
 
-    match hook::handle_hook(&input) {
-        Ok(Some(response)) => {
-            println!("{}", serde_json::to_string(&response)?);
-        }
-        Ok(None) => {}
+    // Parse once for reuse by both the manifest-driven handler and the
+    // Phase 5 wake-up injection path.
+    let hook_input: Option<hook::HookInput> = serde_json::from_str(&input).ok();
+
+    // Phase A/B: manifest-driven hook response.
+    let mut response = match hook::handle_hook(&input) {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("[ndx hook] error: {}", e);
+            eprintln!("[ndx hook] manifest handler error: {}", e);
+            None
+        }
+    };
+
+    // Phase 5: wake-up injection (first Bash command per Claude session).
+    // Soft-fail: any error here must not break the existing hook output.
+    if let Some(ref hi) = hook_input {
+        if let Err(e) = try_inject_wake_up(hi, &mut response) {
+            eprintln!("[ndx hook] wake-up injection skipped: {}", e);
         }
     }
 
+    if let Some(resp) = response {
+        println!("{}", serde_json::to_string(&resp)?);
+    }
+
     // Phase C: log event to memory (best-effort)
-    if let Ok(hook_input) = serde_json::from_str::<hook::HookInput>(&input) {
+    if let Some(hook_input) = hook_input {
         if let Some(command) = hook_input
             .tool_input
             .as_ref()
@@ -407,6 +422,93 @@ fn cmd_hook() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prepend L0+L1 wake-up text to the hook's `additional_context` on the
+/// first Bash hook invocation per Claude session. Scopes to the palace
+/// rooted at the hook payload's `cwd`. Missing session id, missing cwd,
+/// missing palace, and missing model all silently skip (soft-fail).
+/// Spec: R-800..R-805.
+fn try_inject_wake_up(
+    hi: &hook::HookInput,
+    response: &mut Option<hook::HookOutput>,
+) -> Result<()> {
+    // Require a Bash invocation — injection piggy-backs on Bash PreToolUse.
+    if hi.tool_name.as_deref() != Some("Bash") {
+        return Ok(());
+    }
+    let session_id = match hi.session_id.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(()),
+    };
+    let cwd = match hi.cwd.as_deref() {
+        Some(c) if !c.is_empty() => std::path::PathBuf::from(c),
+        _ => return Ok(()),
+    };
+
+    // Walk up for a palace, silently skip if none exists.
+    let root = match find_palace_root(&cwd) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let palace = Palace::open_at(root)?;
+
+    if palace.wake_injection_seen(session_id)? {
+        return Ok(());
+    }
+
+    let wake_text = recall::search::wake_up(&palace)?;
+    let block = format!(
+        "# ndx-recall wake-up (session {})\n{}\n# /wake-up\n",
+        &session_id[..session_id.len().min(8)],
+        wake_text.trim_end()
+    );
+
+    // Either prepend to existing response's additional_context, or create
+    // a minimal response that carries just the wake-up block.
+    match response {
+        Some(resp) => {
+            let existing = resp
+                .hook_specific_output
+                .additional_context
+                .take()
+                .unwrap_or_default();
+            resp.hook_specific_output.additional_context = Some(if existing.is_empty() {
+                block
+            } else {
+                format!("{}\n{}", block, existing)
+            });
+        }
+        None => {
+            *response = Some(hook::HookOutput {
+                hook_specific_output: hook::HookSpecificOutput {
+                    hook_event_name: "PreToolUse".to_string(),
+                    permission_decision: "allow".to_string(),
+                    additional_context: Some(block),
+                    updated_input: None,
+                },
+            });
+        }
+    }
+
+    palace.mark_wake_injected(session_id)?;
+    Ok(())
+}
+
+/// Walk up from a starting directory looking for an existing
+/// `.ndx/recall.redb`. Mirrors `Palace::find` but accepts a starting
+/// path instead of CWD.
+fn find_palace_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cur = start;
+    loop {
+        if cur.join(".ndx").join("recall.redb").is_file() {
+            return Some(cur.to_path_buf());
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return None,
+        }
+    }
 }
 
 fn cmd_filter(key: &str) -> Result<()> {
@@ -878,8 +980,17 @@ fn cmd_recall_drawer(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_recall_wake(_args: &[String]) -> Result<()> {
+fn cmd_recall_wake(args: &[String]) -> Result<()> {
     let palace = Palace::open_from_cwd()?;
+    if args.iter().any(|a| a == "--force") {
+        let cleared = palace.clear_all_wake_injections()?;
+        if cleared > 0 {
+            eprintln!(
+                "cleared {} session wake-up markers; next Bash hook in each session re-injects",
+                cleared
+            );
+        }
+    }
     let text = recall::search::wake_up(&palace)?;
     println!("{}", text);
     Ok(())
