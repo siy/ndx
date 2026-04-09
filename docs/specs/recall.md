@@ -821,3 +821,48 @@ description, rationale.)*
   panic behavior (exit code 101, panic message on stderr) is in effect.
   No functional impact in Phase 1; no panic paths exist in the recall
   code.
+
+- **2026-04-09** — Phase 2 delivered. Conformance check against
+  R-102, R-451..R-454, R-600..R-633 completed. Three mine modes ship
+  (`--from-memory`, `--from-chroma`, `--project`); batch transactions
+  enforce R-631; 22 unit tests green; smoke tests on the ndx repo
+  produced 141 drawers from `docs/` and 62 turn-pair drawers from this
+  project's live session history, idempotent re-mine confirmed.
+  Read-only `drawer list` and `drawer show` shipped as a Phase 2
+  addition (not in the spec's Phase 2 scope but minimal and essential
+  for verifying mine output; full drawer CRUD with `--pending`
+  remains Phase 6).
+
+- **2026-04-09 / Phase 2 / R-613** — `mine --from-chroma` does not
+  preserve the source ChromaDB embeddings in Phase 2. Rationale:
+  ChromaDB stores vectors in per-segment Hnswlib binary files, not in
+  the sqlite database. Reading them cleanly requires either hnswlib
+  bindings or Python. Since `fastembed` does not enter the crate graph
+  until Phase 3, imported drawers carry no embedding until then;
+  re-embedding happens automatically on first semantic search (or
+  explicit `ndx recall reembed`). No drawer content or metadata is
+  lost. Shifts R-613's "reuse existing 384-dim embeddings verbatim"
+  clause to a Phase 3 follow-up: if the source chroma db is still
+  on disk when Phase 3 lands, an optional
+  `ndx recall reembed --from-chroma <path>` could read the hnswlib
+  sidecar. For now, re-embedding is the default path.
+
+- **2026-04-09 / Phase 2 / R-611** — `mine --from-chroma` is
+  implemented against the `embedding_metadata` key-value table which is
+  stable across ChromaDB ≥0.5, targeting the `chroma:document` key for
+  document text. The implementation compiled and unit-tested cleanly
+  but has not yet been validated against a live mempalace ChromaDB
+  export (no such database is present on the development machine).
+  First real import may require small adjustments. Flagged as
+  "needs field validation" rather than a blocking spec divergence;
+  no runtime impact on users without a mempalace install.
+
+- **2026-04-09 / Phase 2 / Phase 6 scope** — `ndx recall drawer list`
+  and `ndx recall drawer show` ship in Phase 2 (read-only subset) to
+  give users a way to verify mine output. Phase 6 still owns the full
+  drawer CRUD surface (add/update/rm/link), the `--pending <op>` filter
+  for skill consumption, and the structured JSON write-back envelopes
+  per R-710 series. The Phase 2 list/show implementations match
+  R-422/R-423 for their slice of the surface (list ordering, JSON
+  output, room filter), which is a spec conformance win rather than
+  a deviation — moving the requirement text up a phase.

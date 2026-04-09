@@ -418,6 +418,8 @@ fn cmd_recall(args: &[String]) -> Result<()> {
         Some("status") => cmd_recall_status(sub_args),
         Some("room") => cmd_recall_room(sub_args),
         Some("identity") => cmd_recall_identity(sub_args),
+        Some("mine") => cmd_recall_mine(sub_args),
+        Some("drawer") => cmd_recall_drawer(sub_args),
         Some(other) => Err(RecallError::usage(format!(
             "unknown recall subcommand `{}`. Run `ndx help` for usage.",
             other
@@ -443,6 +445,15 @@ fn print_recall_usage() {
     eprintln!("  ndx recall room show <name> [--json]");
     eprintln!("  ndx recall room rm <name>");
     eprintln!("  ndx recall room rename <old> <new>");
+    eprintln!();
+    eprintln!("Mining:");
+    eprintln!("  ndx recall mine --from-memory [--since YYYY-MM-DD]");
+    eprintln!("  ndx recall mine --from-chroma <chroma-dir> [--wing NAME]");
+    eprintln!("  ndx recall mine --project [--path DIR]");
+    eprintln!();
+    eprintln!("Drawers (read-only in Phase 2):");
+    eprintln!("  ndx recall drawer list [--room X] [--limit N] [--offset N] [--json]");
+    eprintln!("  ndx recall drawer show --id N [--json]");
     eprintln!();
     eprintln!("Identity:");
     eprintln!("  ndx recall identity show [--merged]");
@@ -662,6 +673,130 @@ fn cmd_recall_identity(args: &[String]) -> Result<()> {
         None => {
             Err(RecallError::usage("usage: ndx recall identity <show|edit>").into())
         }
+    }
+}
+
+fn cmd_recall_mine(args: &[String]) -> Result<()> {
+    let palace = Palace::open_from_cwd()?;
+    let from_memory = args.iter().any(|a| a == "--from-memory");
+    let from_chroma_idx = args.iter().position(|a| a == "--from-chroma");
+    let from_project = args.iter().any(|a| a == "--project");
+
+    let mode_count = [from_memory, from_chroma_idx.is_some(), from_project]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if mode_count != 1 {
+        return Err(RecallError::usage(
+            "usage: ndx recall mine <--from-memory | --from-chroma <dir> | --project [--path DIR]>",
+        )
+        .into());
+    }
+
+    let report = if from_memory {
+        let since = get_flag(args, "--since");
+        recall::mine::mine_from_memory(&palace, since)?
+    } else if let Some(idx) = from_chroma_idx {
+        let chroma_dir = args
+            .get(idx + 1)
+            .filter(|s| !s.starts_with("--"))
+            .ok_or_else(|| {
+                RecallError::usage("usage: ndx recall mine --from-chroma <chroma-dir>")
+            })?;
+        let wing = get_flag(args, "--wing");
+        recall::mine::mine_from_chroma(&palace, std::path::Path::new(chroma_dir), wing)?
+    } else {
+        let path = get_flag(args, "--path").map(std::path::PathBuf::from);
+        recall::mine::mine_project(&palace, path.as_deref())?
+    };
+
+    eprintln!(
+        "mine: added {}, deduped {}, skipped {}",
+        report.added, report.deduped, report.skipped
+    );
+    Ok(())
+}
+
+fn cmd_recall_drawer(args: &[String]) -> Result<()> {
+    let sub = args.first().map(|s| s.as_str());
+    let sub_args: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
+    match sub {
+        Some("list") => {
+            let palace = Palace::open_from_cwd()?;
+            let room = get_flag(sub_args, "--room");
+            let limit = get_flag_usize(sub_args, "--limit").unwrap_or(20);
+            let offset = get_flag_usize(sub_args, "--offset").unwrap_or(0);
+            let drawers = palace.list_drawers(room, limit, offset)?;
+            if sub_args.iter().any(|a| a == "--json") {
+                println!("{}", serde_json::to_string_pretty(&drawers)?);
+            } else if drawers.is_empty() {
+                println!("(no drawers)");
+            } else {
+                for d in &drawers {
+                    let snippet: String = d
+                        .text
+                        .chars()
+                        .take(120)
+                        .collect::<String>()
+                        .replace('\n', " ");
+                    let src = match (&d.source_file, &d.source_session_id) {
+                        (Some(f), _) => format!("  ({})", f),
+                        (None, Some(s)) => format!("  (session: {})", &s[..s.len().min(8)]),
+                        _ => String::new(),
+                    };
+                    println!("[{:>5}] [{}] i={}{}", d.id, d.room, d.importance, src);
+                    println!("        {}", snippet);
+                }
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let id = get_flag_usize(sub_args, "--id")
+                .ok_or_else(|| RecallError::usage("usage: ndx recall drawer show --id N"))?
+                as u64;
+            let palace = Palace::open_from_cwd()?;
+            let drawer = palace.get_drawer(id)?.ok_or_else(|| {
+                RecallError::constraint(format!("drawer {} not found", id))
+            })?;
+            if sub_args.iter().any(|a| a == "--json") {
+                println!("{}", serde_json::to_string_pretty(&drawer)?);
+            } else {
+                println!("id: {}", drawer.id);
+                println!("room: {}", drawer.room);
+                println!("importance: {}", drawer.importance);
+                println!("source_kind: {:?}", drawer.source_kind);
+                if let Some(s) = &drawer.source_session_id {
+                    println!("source_session_id: {}", s);
+                }
+                if let Some(f) = &drawer.source_file {
+                    println!("source_file: {}", f);
+                    if let Some(l) = drawer.source_line {
+                        println!("source_line: {}", l);
+                    }
+                }
+                println!("content_hash: {}", drawer.content_hash);
+                println!("created_at: {}", format_unix(drawer.created_at));
+                println!("updated_at: {}", format_unix(drawer.updated_at));
+                if !drawer.metadata.is_empty() {
+                    println!("metadata:");
+                    for (k, v) in &drawer.metadata {
+                        println!("  {}: {}", k, v);
+                    }
+                }
+                println!();
+                println!("{}", drawer.text);
+            }
+            Ok(())
+        }
+        Some(other) => Err(RecallError::usage(format!(
+            "unknown `recall drawer` subcommand `{}`",
+            other
+        ))
+        .into()),
+        None => Err(RecallError::usage(
+            "usage: ndx recall drawer <list|show>  (more in Phase 6)",
+        )
+        .into()),
     }
 }
 

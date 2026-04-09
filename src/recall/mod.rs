@@ -13,6 +13,7 @@
 
 pub mod error;
 pub mod identity;
+pub mod mine;
 
 use anyhow::{Context, Result};
 use redb::{
@@ -31,6 +32,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const UNCLASSIFIED_ROOM: &str = "unclassified";
 pub const DEFAULT_IMPORTANCE: u8 = 5;
 pub const MAX_DRAWER_TEXT_BYTES: usize = 8 * 1024;
+/// Upper bound on drawers per write transaction during mining (R-631).
+pub const MINE_BATCH_SIZE: usize = 1000;
 
 // Table definitions. Values are serde_json bytes unless noted.
 
@@ -137,6 +140,15 @@ impl LinkKind {
             _ => None,
         }
     }
+}
+
+/// Outcome of a drawer insert. `deduped = true` means the content hash
+/// matched an existing drawer and importance was bumped instead of a new row
+/// being written.
+#[derive(Debug, Clone, Copy)]
+pub struct DrawerInsertOutcome {
+    pub id: u64,
+    pub deduped: bool,
 }
 
 /// Stats for `ndx recall status`.
@@ -486,9 +498,57 @@ impl Palace {
     // ── Drawers (Phase 1 primitives only; CLI plumbing in Phase 2/6) ──
 
     /// Insert a drawer with content-hash dedup (R-102). Returns the stored
-    /// id (either newly allocated or an existing duplicate whose importance
-    /// was bumped by 1, capped at 10).
-    pub fn insert_drawer(&self, mut input: Drawer) -> Result<u64> {
+    /// id and whether this was a dedup hit (existing drawer's importance
+    /// was bumped by 1, capped at 10) or a fresh insert.
+    pub fn insert_drawer(&self, input: Drawer) -> Result<DrawerInsertOutcome> {
+        let txn = self.db.begin_write()?;
+        let outcome = self.insert_drawer_in_txn(&txn, input)?;
+        txn.commit()?;
+        Ok(outcome)
+    }
+
+    /// Insert many drawers, batching into transactions of at most
+    /// [`MINE_BATCH_SIZE`] per commit (R-631). Partial failures leave
+    /// already-committed batches persisted (R-632).
+    pub fn insert_drawers_batch<I: IntoIterator<Item = Drawer>>(
+        &self,
+        drawers: I,
+    ) -> Result<Vec<DrawerInsertOutcome>> {
+        let mut outcomes = Vec::new();
+        let mut buf: Vec<Drawer> = Vec::with_capacity(MINE_BATCH_SIZE);
+        for d in drawers {
+            buf.push(d);
+            if buf.len() >= MINE_BATCH_SIZE {
+                self.commit_drawer_batch(std::mem::take(&mut buf), &mut outcomes)?;
+            }
+        }
+        if !buf.is_empty() {
+            self.commit_drawer_batch(buf, &mut outcomes)?;
+        }
+        Ok(outcomes)
+    }
+
+    fn commit_drawer_batch(
+        &self,
+        batch: Vec<Drawer>,
+        outcomes: &mut Vec<DrawerInsertOutcome>,
+    ) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        for d in batch {
+            let outcome = self.insert_drawer_in_txn(&txn, d)?;
+            outcomes.push(outcome);
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Body of a drawer insert, scoped to an already-open write transaction.
+    /// The caller is responsible for commit.
+    fn insert_drawer_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        mut input: Drawer,
+    ) -> Result<DrawerInsertOutcome> {
         if input.text.len() > MAX_DRAWER_TEXT_BYTES {
             input
                 .text
@@ -513,96 +573,151 @@ impl Palace {
         }
         input.updated_at = now;
 
-        let txn = self.db.begin_write()?;
-        let id: u64;
+        // Probe by hash.
+        let existing_id: Option<u64>;
         {
-            // Probe by hash.
-            let existing_id: Option<u64>;
-            {
-                let by_hash = txn.open_table(DRAWER_BY_HASH)?;
-                let fetched = by_hash
-                    .get(hash_bytes.as_slice())?
-                    .map(|v| v.value());
-                existing_id = fetched;
+            let by_hash = txn.open_table(DRAWER_BY_HASH)?;
+            let fetched = by_hash.get(hash_bytes.as_slice())?.map(|v| v.value());
+            existing_id = fetched;
+        }
+
+        match existing_id {
+            Some(eid) => {
+                // Dedup: bump importance on existing drawer.
+                let existing_bytes: Option<Vec<u8>>;
+                {
+                    let drawers = txn.open_table(DRAWERS)?;
+                    let fetched = drawers.get(eid)?.map(|v| v.value().to_vec());
+                    existing_bytes = fetched;
+                }
+                if let Some(bytes) = existing_bytes {
+                    let mut existing: Drawer = serde_json::from_slice(&bytes)?;
+                    existing.importance =
+                        existing.importance.saturating_add(1).min(10);
+                    existing.updated_at = now;
+                    let new_bytes = serde_json::to_vec(&existing)?;
+                    let mut drawers = txn.open_table(DRAWERS)?;
+                    drawers.insert(eid, new_bytes.as_slice())?;
+                }
+                Ok(DrawerInsertOutcome {
+                    id: eid,
+                    deduped: true,
+                })
             }
+            None => {
+                // Allocate a fresh id and persist.
+                let id = self.alloc_drawer_id();
+                input.id = id;
 
-            match existing_id {
-                Some(eid) => {
-                    // Dedup: bump importance on existing drawer.
-                    id = eid;
-                    let existing_bytes: Option<Vec<u8>>;
-                    {
-                        let drawers = txn.open_table(DRAWERS)?;
-                        let fetched = drawers.get(id)?.map(|v| v.value().to_vec());
-                        existing_bytes = fetched;
-                    }
-                    if let Some(bytes) = existing_bytes {
-                        let mut existing: Drawer = serde_json::from_slice(&bytes)?;
-                        existing.importance =
-                            existing.importance.saturating_add(1).min(10);
-                        existing.updated_at = now;
-                        let new_bytes = serde_json::to_vec(&existing)?;
-                        let mut drawers = txn.open_table(DRAWERS)?;
-                        drawers.insert(id, new_bytes.as_slice())?;
-                    }
+                {
+                    let mut by_hash = txn.open_table(DRAWER_BY_HASH)?;
+                    by_hash.insert(hash_bytes.as_slice(), id)?;
                 }
-                None => {
-                    // Allocate a fresh id and persist.
-                    id = self.alloc_drawer_id();
-                    input.id = id;
 
-                    {
-                        let mut by_hash = txn.open_table(DRAWER_BY_HASH)?;
-                        by_hash.insert(hash_bytes.as_slice(), id)?;
-                    }
-
-                    // Ensure target room exists.
-                    let room_exists: bool;
-                    {
-                        let rooms = txn.open_table(ROOMS)?;
-                        let found = rooms.get(input.room.as_str())?.is_some();
-                        room_exists = found;
-                    }
-                    if !room_exists {
-                        let room = Room {
-                            name: input.room.clone(),
-                            title: None,
-                            description: None,
-                            created_at: now,
-                        };
-                        let rb = serde_json::to_vec(&room)?;
-                        let mut rooms = txn.open_table(ROOMS)?;
-                        rooms.insert(input.room.as_str(), rb.as_slice())?;
-                    }
-
-                    // Persist drawer row.
-                    let drawer_bytes = serde_json::to_vec(&input)?;
-                    {
-                        let mut drawers = txn.open_table(DRAWERS)?;
-                        drawers.insert(id, drawer_bytes.as_slice())?;
-                    }
-
-                    // Maintain room and source-xref indexes.
-                    add_to_room_index(&txn, &input.room, id)?;
-                    if let Some(sid) = input.source_session_id.as_deref() {
-                        add_to_string_index(&txn, SESSION_DRAWER_XREF, sid, id)?;
-                    }
-                    if let Some(fp) = input.source_file.as_deref() {
-                        add_to_string_index(&txn, FILE_DRAWER_XREF, fp, id)?;
-                    }
-
-                    // Persist next_drawer_id counter.
-                    let next = self.next_drawer_id.load(Ordering::Relaxed);
-                    let mut meta = txn.open_table(META)?;
-                    meta.insert(
-                        "next_drawer_id",
-                        next.to_le_bytes().as_slice(),
-                    )?;
+                // Ensure target room exists.
+                let room_exists: bool;
+                {
+                    let rooms = txn.open_table(ROOMS)?;
+                    let found = rooms.get(input.room.as_str())?.is_some();
+                    room_exists = found;
                 }
+                if !room_exists {
+                    let room = Room {
+                        name: input.room.clone(),
+                        title: None,
+                        description: None,
+                        created_at: now,
+                    };
+                    let rb = serde_json::to_vec(&room)?;
+                    let mut rooms = txn.open_table(ROOMS)?;
+                    rooms.insert(input.room.as_str(), rb.as_slice())?;
+                }
+
+                // Persist drawer row.
+                let drawer_bytes = serde_json::to_vec(&input)?;
+                {
+                    let mut drawers = txn.open_table(DRAWERS)?;
+                    drawers.insert(id, drawer_bytes.as_slice())?;
+                }
+
+                // Maintain room and source-xref indexes.
+                add_to_room_index(txn, &input.room, id)?;
+                if let Some(sid) = input.source_session_id.as_deref() {
+                    add_to_string_index(txn, SESSION_DRAWER_XREF, sid, id)?;
+                }
+                if let Some(fp) = input.source_file.as_deref() {
+                    add_to_string_index(txn, FILE_DRAWER_XREF, fp, id)?;
+                }
+
+                // Persist next_drawer_id counter.
+                let next = self.next_drawer_id.load(Ordering::Relaxed);
+                let mut meta = txn.open_table(META)?;
+                meta.insert(
+                    "next_drawer_id",
+                    next.to_le_bytes().as_slice(),
+                )?;
+
+                Ok(DrawerInsertOutcome { id, deduped: false })
             }
         }
+    }
+
+    /// Record `last_mined_at` in META.
+    pub fn mark_last_mined(&self) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            meta.insert("last_mined_at", now_unix().to_le_bytes().as_slice())?;
+        }
         txn.commit()?;
-        Ok(id)
+        Ok(())
+    }
+
+    /// List drawers filtered by optional room, ordered by id ascending.
+    /// Used by Phase 2's read-only `drawer list` command and by later
+    /// skill-facing commands in Phase 6.
+    pub fn list_drawers(
+        &self,
+        room: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Drawer>> {
+        let rtxn = self.db.begin_read()?;
+        let drawers_tbl = rtxn.open_table(DRAWERS)?;
+        let mut out = Vec::new();
+
+        if let Some(room_name) = room {
+            // Fast path via the room index.
+            let by_room = rtxn.open_table(DRAWERS_BY_ROOM)?;
+            let ids_bytes = by_room
+                .get(room_name)?
+                .map(|v| v.value().to_vec())
+                .unwrap_or_default();
+            let ids = decode_u64_list(&ids_bytes);
+            for id in ids.into_iter().skip(offset).take(limit) {
+                if let Some(v) = drawers_tbl.get(id)? {
+                    let drawer: Drawer = serde_json::from_slice(v.value())?;
+                    out.push(drawer);
+                }
+            }
+        } else {
+            // Slow path: full scan.
+            let mut seen: usize = 0;
+            for entry in drawers_tbl.iter()? {
+                let (_, v) = entry?;
+                if seen < offset {
+                    seen += 1;
+                    continue;
+                }
+                if out.len() >= limit {
+                    break;
+                }
+                let drawer: Drawer = serde_json::from_slice(v.value())?;
+                out.push(drawer);
+                seen += 1;
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_drawer(&self, id: u64) -> Result<Option<Drawer>> {
@@ -843,10 +958,12 @@ mod tests {
             updated_at: 0,
             metadata: BTreeMap::new(),
         };
-        let id1 = p.insert_drawer(mk()).unwrap();
-        let id2 = p.insert_drawer(mk()).unwrap();
-        assert_eq!(id1, id2, "dedup should return same id");
-        let d = p.get_drawer(id1).unwrap().unwrap();
+        let o1 = p.insert_drawer(mk()).unwrap();
+        let o2 = p.insert_drawer(mk()).unwrap();
+        assert_eq!(o1.id, o2.id, "dedup should return same id");
+        assert!(!o1.deduped);
+        assert!(o2.deduped);
+        let d = p.get_drawer(o1.id).unwrap().unwrap();
         assert_eq!(d.importance, 6, "importance should bump by 1");
     }
 
@@ -871,13 +988,13 @@ mod tests {
             updated_at: 0,
             metadata: BTreeMap::new(),
         };
-        let id = p.insert_drawer(d.clone()).unwrap();
+        let o1 = p.insert_drawer(d.clone()).unwrap();
         d.text = "world".into();
-        let id2 = p.insert_drawer(d).unwrap();
-        assert_ne!(id, id2);
+        let o2 = p.insert_drawer(d).unwrap();
+        assert_ne!(o1.id, o2.id);
         let moved = p.rename_room("foo", "bar").unwrap();
         assert_eq!(moved, 2);
-        let d1 = p.get_drawer(id).unwrap().unwrap();
+        let d1 = p.get_drawer(o1.id).unwrap().unwrap();
         assert_eq!(d1.room, "bar");
         assert!(p.get_room("foo").unwrap().is_none());
         assert!(p.get_room("bar").unwrap().is_some());
