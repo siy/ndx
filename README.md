@@ -45,38 +45,85 @@ Memory and recall commands access their databases directly — no daemon needed.
 
 ## Installation
 
-### From source
+### Quick install (from source)
 
-Requires [Rust](https://rustup.rs/) 1.70+.
+Requires [Rust](https://rustup.rs/) 1.70+ and git.
 
 ```sh
-git clone <repo>
+curl -fsSL https://raw.githubusercontent.com/siy/ndx/master/install.sh | bash
+```
+
+This clones, builds the release binary, copies it to `~/.local/bin/ndx`, downloads 289 command manifests, registers the PreToolUse hook, and installs 7 slash commands (`/ndx`, `/ndx-recall-classify`, `-score`, `-dedupe`, `-contradict`, `-summarize`, `-handover`). Restart Claude Code after install.
+
+### Manual install
+
+```sh
+git clone https://github.com/siy/ndx.git
 cd ndx
 cargo build --release
 cp target/release/ndx ~/.local/bin/
-```
-
-### Setup
-
-After building, run the installer to download command manifests and register the hook and skill:
-
-```sh
 ndx install
 ```
-
-This will:
-1. Download 289 YAML command manifests from [kcp-commands](https://github.com/Cantara/kcp-commands) to `~/.ndx/commands/`
-2. Register the PreToolUse Bash hook in `~/.claude/settings.json`
-3. Install the ndx skill to `~/.claude/commands/ndx.md`
 
 ### Per-project setup
 
 ```sh
 cd /path/to/your/project
-ndx init
+ndx init                    # installs 7 skill files + adds .ndx/ to .gitignore
+ndx recall init             # creates the recall palace (.ndx/recall.redb)
 ```
 
-Installs the ndx skill into the project's `.claude/commands/` directory.
+## Recall Palace Workflow
+
+The recall palace is a per-project structured memory that stores decisions, rationale, architecture, and context — everything that disappears when a session ends. Here's the recommended lifecycle:
+
+### 1. Seed the palace
+
+```sh
+# Derive drawers from past Claude Code sessions about this project
+ndx recall mine --from-memory
+
+# Optionally mine specific high-value files (not the whole tree)
+ndx recall mine --project --path CHANGELOG.md
+ndx recall mine --project --path docs/architecture.md
+```
+
+**Tip:** Don't mine the entire repo blindly. Code files and large doc trees produce thousands of paragraph fragments that just duplicate the content. Mine session memory for decisions/rationale, and cherry-pick the files that capture *why*, not *what*.
+
+### 2. Classify and score (via Claude)
+
+```
+/ndx-recall-classify        # assign rooms to unclassified drawers
+/ndx-recall-score           # set importance (1-10) on default-5 drawers
+```
+
+Claude reads each drawer's text, proposes a room (e.g. `architecture`, `decisions`, `people`, `tools`), and scores importance. You review. Expect to delete noise drawers (assistant narration, markdown separators) during classification.
+
+### 3. Search and retrieve
+
+```sh
+ndx recall search "why did we choose JWT"      # hybrid semantic + lexical
+ndx recall wake                                 # L0 identity + L1 top drawers (for prompt injection)
+ndx recall get --room decisions --limit 10      # all decisions, ranked by importance
+```
+
+The hook automatically injects wake-up context (L0 + L1) on the first Bash command of each Claude session — no manual `wake` needed.
+
+### 4. Maintain over time
+
+```
+/ndx-recall-dedupe          # merge near-duplicates after large mines
+/ndx-recall-contradict      # flag stale vs current claims
+/ndx-recall-summarize       # generate per-room summaries
+```
+
+### 5. Hand over to the next session
+
+```
+/ndx-recall-handover        # Claude reflects on what it learned, saves as memories
+```
+
+This closes the loop: each session leaves the next one smarter. Mining, classification, and scoring compound — the palace gets more useful the more you use it.
 
 ## CLI
 

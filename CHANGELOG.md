@@ -1,9 +1,16 @@
 # Changelog
 
+## v0.5.3 — Workflow docs, curl installer, handover skill
+
+- Added "Recall Palace Workflow" section to README with step-by-step lifecycle guide
+- Added `install.sh` — one-line from-source installer (`curl | bash`)
+- Added `/ndx-recall-handover` skill — session knowledge handover
+- Updated Installation section with curl install + manual paths
+- 7 skill files now ship with `ndx install` / `ndx init`
+
 ## v0.5.2 — /ndx-recall-handover skill
 
-- Added `/ndx-recall-handover` — session knowledge handover skill that prompts Claude to reflect on what it learned and save durable insights as memories for the next session
-- 7 skill files now ship with `ndx install` / `ndx init`
+- Added `/ndx-recall-handover` slash command
 
 ## v0.5.1 — QoL: auto-gitignore .ndx/
 
