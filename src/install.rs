@@ -219,18 +219,25 @@ Score drawers that still have the default importance (5). Importance is used to 
    ```
    Returns drawers that currently have `importance == 5` and `source_kind != Manual` (manually-set drawers are excluded from rescoring).
 
-2. **Score each drawer on a 1-10 scale**
+2. **Bulk-score by source file when patterns are clear**
+   If all drawers from a source file deserve the same score:
+   ```bash
+   ndx recall drawer update --source-file CHANGELOG.md --importance 4
+   ndx recall drawer update --source-file docs/specs/ --importance 7
+   ```
+
+3. **Score remaining drawers individually on a 1-10 scale**
    - **10** — Core identity facts, critical decisions, irreversible constraints. Always load in wake-up.
    - **7-9** — Important decisions, rationale, architectural pillars, people the user collaborates with regularly.
    - **4-6** — Normal context: conversations, code patterns, general project facts.
    - **1-3** — Low-signal noise, incidental output, boilerplate the dedup path amplified by accident.
 
-3. **Apply scores**
+4. **Apply individual scores**
    ```bash
    ndx recall drawer update --id <N> --importance <1..10> --json
    ```
 
-4. **Downgrade noise aggressively**
+5. **Downgrade noise aggressively**
    Drawers whose text is a markdown separator, a heading with no body, or repeated boilerplate should be scored 1-2 or deleted:
    ```bash
    ndx recall drawer rm --id <N>
@@ -354,6 +361,7 @@ Reflect on what you learned during this session and save actionable observations
    - **Mining strategy** — what to mine, what to skip, which paths have signal vs noise
    - **Room taxonomy** — which rooms worked, which were too broad or too narrow, naming conventions
    - **Scoring calibration** — what importance levels felt right for this project's content
+   - **Bulk operation shortcuts** — which source files map cleanly to rooms or importance levels (e.g. `--source-file CHANGELOG.md --room releases` saved 90% of classify work)
    - **User preferences** — corrections the user made, patterns they prefer, things they rejected
    - **Project-specific patterns** — architectural decisions, key people, recurring themes, terminology
 
