@@ -156,6 +156,40 @@ pub struct DrawerInsertOutcome {
     pub deduped: bool,
 }
 
+/// Operation that a skill is about to perform on a batch of drawers.
+/// Used by `ndx recall drawer list --pending <op> --json` per R-701.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingOp {
+    Classify,
+    Score,
+    Dedupe,
+    Contradict,
+    Summarize,
+}
+
+impl PendingOp {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "classify" => Some(Self::Classify),
+            "score" => Some(Self::Score),
+            "dedupe" => Some(Self::Dedupe),
+            "contradict" => Some(Self::Contradict),
+            "summarize" => Some(Self::Summarize),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Classify => "classify",
+            Self::Score => "score",
+            Self::Dedupe => "dedupe",
+            Self::Contradict => "contradict",
+            Self::Summarize => "summarize",
+        }
+    }
+}
+
 /// Stats for `ndx recall status`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PalaceStats {
@@ -908,6 +942,437 @@ impl Palace {
         Ok(out)
     }
 
+    // ── Drawer mutation (Phase 6 / R-424, R-425, R-427) ──
+
+    /// Update a drawer's mutable fields. Any subset of (room, importance,
+    /// text) may be changed. Returns the post-update drawer.
+    ///
+    /// Changing `text` recomputes the content hash, re-registers the
+    /// drawer under its new hash (subject to collision dedup), and
+    /// regenerates the trigram posting list. Importance/room edits do
+    /// not touch the embedding or trigram index.
+    pub fn update_drawer(
+        &self,
+        id: u64,
+        new_room: Option<&str>,
+        new_importance: Option<u8>,
+        new_text: Option<&str>,
+    ) -> Result<Drawer> {
+        if let Some(r) = new_room {
+            validate_room_name(r)?;
+        }
+        if let Some(i) = new_importance {
+            if !(1..=10).contains(&i) {
+                return Err(RecallError::usage(
+                    "importance must be in 1..=10",
+                )
+                .into());
+            }
+        }
+
+        // Fetch current row.
+        let current_bytes: Vec<u8> = {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(DRAWERS)?;
+            let fetched = tbl.get(id)?.map(|v| v.value().to_vec());
+            fetched.ok_or_else(|| {
+                RecallError::constraint(format!("drawer {} not found", id))
+            })?
+        };
+        let mut drawer: Drawer = serde_json::from_slice(&current_bytes)?;
+        let old_room = drawer.room.clone();
+        let old_hash_hex = drawer.content_hash.clone();
+        let old_text = drawer.text.clone();
+
+        if let Some(r) = new_room {
+            drawer.room = r.to_string();
+        }
+        if let Some(i) = new_importance {
+            drawer.importance = i;
+        }
+        if let Some(t) = new_text {
+            drawer.text = t.to_string();
+            if drawer.text.len() > MAX_DRAWER_TEXT_BYTES {
+                drawer.text.truncate(MAX_DRAWER_TEXT_BYTES.saturating_sub(16));
+                drawer.text.push_str("… [truncated]");
+            }
+            let h = blake3::hash(drawer.text.as_bytes());
+            drawer.content_hash = h.to_hex().to_string();
+        }
+        drawer.updated_at = now_unix();
+
+        let txn = self.db.begin_write()?;
+        {
+            // Room index maintenance.
+            if drawer.room != old_room {
+                remove_from_room_index(&txn, &old_room, id)?;
+                // Ensure the target room exists so list_rooms shows it
+                // after reassignment.
+                let needs_create: bool;
+                {
+                    let rooms = txn.open_table(ROOMS)?;
+                    needs_create = rooms.get(drawer.room.as_str())?.is_none();
+                }
+                if needs_create {
+                    let room = Room {
+                        name: drawer.room.clone(),
+                        title: None,
+                        description: None,
+                        created_at: now_unix(),
+                    };
+                    let rb = serde_json::to_vec(&room)?;
+                    let mut rooms = txn.open_table(ROOMS)?;
+                    rooms.insert(drawer.room.as_str(), rb.as_slice())?;
+                }
+                add_to_room_index(&txn, &drawer.room, id)?;
+            }
+
+            // Hash re-registration and trigram rebuild if text changed.
+            if let Some(_) = new_text {
+                // Remove old hash → id binding.
+                let old_hash_bytes = hex_decode_32(&old_hash_hex)
+                    .context("stored content_hash is not valid hex")?;
+                {
+                    let mut by_hash = txn.open_table(DRAWER_BY_HASH)?;
+                    by_hash.remove(old_hash_bytes.as_slice())?;
+                }
+                // Remove old trigrams.
+                let old_tris = extract_drawer_trigrams(&old_text);
+                if !old_tris.is_empty() {
+                    let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
+                    for tri in old_tris {
+                        let key = tri.as_slice();
+                        let ids_bytes: Vec<u8>;
+                        {
+                            let fetched = tri_tbl.get(key)?.map(|v| v.value().to_vec());
+                            ids_bytes = fetched.unwrap_or_default();
+                        }
+                        let mut ids = decode_u64_list(&ids_bytes);
+                        ids.retain(|x| *x != id);
+                        if ids.is_empty() {
+                            tri_tbl.remove(key)?;
+                        } else {
+                            tri_tbl.insert(key, encode_u64_list(&ids).as_slice())?;
+                        }
+                    }
+                }
+
+                // Insert new hash → id binding (dedup guard).
+                let new_hash_bytes = hex_decode_32(&drawer.content_hash)
+                    .context("new content_hash is not valid hex")?;
+                let existing_for_hash: Option<u64>;
+                {
+                    let by_hash = txn.open_table(DRAWER_BY_HASH)?;
+                    let fetched = by_hash
+                        .get(new_hash_bytes.as_slice())?
+                        .map(|v| v.value());
+                    existing_for_hash = fetched;
+                }
+                match existing_for_hash {
+                    Some(other) if other != id => {
+                        // The new text collides with another drawer's content —
+                        // refuse. Callers should use drawer rm + drawer add in
+                        // that case.
+                        return Err(RecallError::constraint(format!(
+                            "new text collides with existing drawer {}",
+                            other
+                        ))
+                        .into());
+                    }
+                    _ => {
+                        let mut by_hash = txn.open_table(DRAWER_BY_HASH)?;
+                        by_hash.insert(new_hash_bytes.as_slice(), id)?;
+                    }
+                }
+
+                // Rebuild trigrams from new text.
+                let new_tris = extract_drawer_trigrams(&drawer.text);
+                if !new_tris.is_empty() {
+                    let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
+                    for tri in new_tris {
+                        let key = tri.as_slice();
+                        let ids_bytes: Vec<u8>;
+                        {
+                            let fetched = tri_tbl.get(key)?.map(|v| v.value().to_vec());
+                            ids_bytes = fetched.unwrap_or_default();
+                        }
+                        let mut ids = decode_u64_list(&ids_bytes);
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                            ids.sort_unstable();
+                        }
+                        tri_tbl.insert(key, encode_u64_list(&ids).as_slice())?;
+                    }
+                }
+            }
+
+            // Persist updated drawer row.
+            let bytes = serde_json::to_vec(&drawer)?;
+            let mut drawers = txn.open_table(DRAWERS)?;
+            drawers.insert(id, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(drawer)
+    }
+
+    /// Delete a drawer and cascade across every satellite table:
+    /// DRAWER_BY_HASH, DRAWER_EMBEDDINGS, DRAWERS_BY_ROOM, DRAWER_TRIGRAMS,
+    /// FILE_DRAWER_XREF, SESSION_DRAWER_XREF, COMMIT_DRAWER_XREF (best-effort
+    /// scan), and LINKS in both directions (R-124).
+    pub fn delete_drawer(&self, id: u64) -> Result<bool> {
+        // Fetch full row first so we know what indexes to clean.
+        let bytes: Option<Vec<u8>> = {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(DRAWERS)?;
+            let fetched = tbl.get(id)?.map(|v| v.value().to_vec());
+            fetched
+        };
+        let drawer: Drawer = match bytes {
+            Some(b) => serde_json::from_slice(&b)?,
+            None => return Ok(false),
+        };
+
+        let txn = self.db.begin_write()?;
+        {
+            // Primary row.
+            {
+                let mut drawers = txn.open_table(DRAWERS)?;
+                drawers.remove(id)?;
+            }
+            // Content-hash binding.
+            if let Ok(h) = hex_decode_32(&drawer.content_hash) {
+                let mut by_hash = txn.open_table(DRAWER_BY_HASH)?;
+                by_hash.remove(h.as_slice())?;
+            }
+            // Embedding row.
+            {
+                let mut tbl = txn.open_table(DRAWER_EMBEDDINGS)?;
+                tbl.remove(id)?;
+            }
+            // Room index.
+            remove_from_room_index(&txn, &drawer.room, id)?;
+            // Trigram postings.
+            let tris = extract_drawer_trigrams(&drawer.text);
+            if !tris.is_empty() {
+                let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
+                for tri in tris {
+                    let key = tri.as_slice();
+                    let ids_bytes: Vec<u8>;
+                    {
+                        let fetched = tri_tbl.get(key)?.map(|v| v.value().to_vec());
+                        ids_bytes = fetched.unwrap_or_default();
+                    }
+                    let mut ids = decode_u64_list(&ids_bytes);
+                    ids.retain(|x| *x != id);
+                    if ids.is_empty() {
+                        tri_tbl.remove(key)?;
+                    } else {
+                        tri_tbl.insert(key, encode_u64_list(&ids).as_slice())?;
+                    }
+                }
+            }
+            // File xref.
+            if let Some(fp) = drawer.source_file.as_deref() {
+                remove_from_string_index(&txn, FILE_DRAWER_XREF, fp, id)?;
+            }
+            // Session xref.
+            if let Some(sid) = drawer.source_session_id.as_deref() {
+                remove_from_string_index(&txn, SESSION_DRAWER_XREF, sid, id)?;
+            }
+            // Commit xref is populated on-demand and may contain this id;
+            // scan and prune rather than recompute.
+            {
+                let keys: Vec<(String, Vec<u8>)> = {
+                    let tbl = txn.open_table(COMMIT_DRAWER_XREF)?;
+                    let mut out = Vec::new();
+                    for entry in tbl.iter()? {
+                        let (k, v) = entry?;
+                        out.push((k.value().to_string(), v.value().to_vec()));
+                    }
+                    out
+                };
+                let mut tbl = txn.open_table(COMMIT_DRAWER_XREF)?;
+                for (commit, ids_bytes) in keys {
+                    let mut ids = decode_u64_list(&ids_bytes);
+                    let before = ids.len();
+                    ids.retain(|x| *x != id);
+                    if ids.len() != before {
+                        if ids.is_empty() {
+                            tbl.remove(commit.as_str())?;
+                        } else {
+                            tbl.insert(commit.as_str(), encode_u64_list(&ids).as_slice())?;
+                        }
+                    }
+                }
+            }
+            // Links in both directions.
+            {
+                let keys_to_drop: Vec<Vec<u8>> = {
+                    let tbl = txn.open_table(LINKS)?;
+                    let mut out = Vec::new();
+                    for entry in tbl.iter()? {
+                        let (k, _) = entry?;
+                        let key = k.value();
+                        if key.len() != 17 {
+                            continue;
+                        }
+                        let from = u64::from_le_bytes([
+                            key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                        ]);
+                        let to = u64::from_le_bytes([
+                            key[8], key[9], key[10], key[11], key[12], key[13], key[14],
+                            key[15],
+                        ]);
+                        if from == id || to == id {
+                            out.push(key.to_vec());
+                        }
+                    }
+                    out
+                };
+                let mut tbl = txn.open_table(LINKS)?;
+                for k in keys_to_drop {
+                    tbl.remove(k.as_slice())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(true)
+    }
+
+    /// Delete matching links. If `kind` is `None`, all links between the
+    /// pair are deleted regardless of kind. Returns the number removed.
+    pub fn unlink_drawers(
+        &self,
+        from: u64,
+        to: u64,
+        kind: Option<LinkKind>,
+    ) -> Result<u64> {
+        let txn = self.db.begin_write()?;
+        let removed: u64;
+        {
+            let keys_to_drop: Vec<Vec<u8>> = {
+                let tbl = txn.open_table(LINKS)?;
+                let mut out = Vec::new();
+                for entry in tbl.iter()? {
+                    let (k, _) = entry?;
+                    let key = k.value();
+                    if key.len() != 17 {
+                        continue;
+                    }
+                    let f = u64::from_le_bytes([
+                        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                    ]);
+                    let t = u64::from_le_bytes([
+                        key[8], key[9], key[10], key[11], key[12], key[13], key[14],
+                        key[15],
+                    ]);
+                    if f != from || t != to {
+                        continue;
+                    }
+                    if let Some(want) = kind {
+                        if key[16] != want as u8 {
+                            continue;
+                        }
+                    }
+                    out.push(key.to_vec());
+                }
+                out
+            };
+            removed = keys_to_drop.len() as u64;
+            let mut tbl = txn.open_table(LINKS)?;
+            for k in keys_to_drop {
+                tbl.remove(k.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    // ── Pending-op discovery (Phase 6 / R-701 + skill contracts) ──
+
+    /// Enumerate drawers needing a given skill operation.
+    /// `classify` → `room == "unclassified"`
+    /// `score` → `importance == 5 AND source_kind != Manual`
+    /// `dedupe`, `contradict`, `summarize` — see `PendingOp` docs.
+    pub fn list_pending(&self, op: PendingOp, limit: usize) -> Result<Vec<Drawer>> {
+        let all = self.list_drawers(None, usize::MAX, 0)?;
+        let filtered: Vec<Drawer> = match op {
+            PendingOp::Classify => all
+                .into_iter()
+                .filter(|d| d.room == UNCLASSIFIED_ROOM)
+                .take(limit)
+                .collect(),
+            PendingOp::Score => all
+                .into_iter()
+                .filter(|d| d.importance == DEFAULT_IMPORTANCE
+                    && !matches!(d.source_kind, SourceKind::Manual))
+                .take(limit)
+                .collect(),
+            PendingOp::Dedupe => {
+                // Candidate pool: drawers whose content_hash prefix collides
+                // with any other drawer (Phase 6 heuristic v1 — simpler than
+                // trigram overlap pair discovery, still useful).
+                let mut by_prefix: std::collections::HashMap<String, Vec<Drawer>> =
+                    Default::default();
+                for d in all {
+                    let key = d.content_hash.chars().take(6).collect::<String>();
+                    by_prefix.entry(key).or_default().push(d);
+                }
+                let mut candidates: Vec<Drawer> = Vec::new();
+                for (_, group) in by_prefix {
+                    if group.len() > 1 {
+                        candidates.extend(group);
+                    }
+                }
+                candidates.into_iter().take(limit).collect()
+            }
+            PendingOp::Contradict => {
+                // Placeholder heuristic: drawers that already have an
+                // incoming link of any kind are in scope for contradict
+                // review. Real contradict-candidate discovery (K-trigram
+                // overlap pairs) is a v2 refinement.
+                let mut with_incoming: std::collections::HashSet<u64> = Default::default();
+                {
+                    let rtxn = self.db.begin_read()?;
+                    let tbl = rtxn.open_table(LINKS)?;
+                    for entry in tbl.iter()? {
+                        let (k, _) = entry?;
+                        let key = k.value();
+                        if key.len() != 17 {
+                            continue;
+                        }
+                        let to = u64::from_le_bytes([
+                            key[8], key[9], key[10], key[11], key[12], key[13], key[14],
+                            key[15],
+                        ]);
+                        with_incoming.insert(to);
+                    }
+                }
+                all.into_iter()
+                    .filter(|d| with_incoming.contains(&d.id))
+                    .take(limit)
+                    .collect()
+            }
+            PendingOp::Summarize => {
+                // One representative drawer per non-empty room — the top
+                // importance entry per room.
+                let mut by_room: BTreeMap<String, Drawer> = BTreeMap::new();
+                for d in all {
+                    by_room
+                        .entry(d.room.clone())
+                        .and_modify(|e| {
+                            if d.importance > e.importance {
+                                *e = d.clone();
+                            }
+                        })
+                        .or_insert(d);
+                }
+                by_room.into_values().take(limit).collect()
+            }
+        };
+        Ok(filtered)
+    }
+
     // ── Wake-up injection state (Phase 5 / R-160 series) ──
 
     /// Return true if wake-up text has already been injected into the
@@ -1315,10 +1780,12 @@ fn add_to_string_index(
     id: u64,
 ) -> Result<()> {
     let mut t = txn.open_table(table_def)?;
-    let mut ids = t
-        .get(key)?
-        .map(|v| decode_u64_list(v.value()))
-        .unwrap_or_default();
+    let existing: Vec<u8>;
+    {
+        let fetched = t.get(key)?.map(|v| v.value().to_vec());
+        existing = fetched.unwrap_or_default();
+    }
+    let mut ids = decode_u64_list(&existing);
     if !ids.contains(&id) {
         ids.push(id);
         ids.sort_unstable();
@@ -1327,6 +1794,52 @@ fn add_to_string_index(
     let bytes = encode_u64_list(&ids);
     t.insert(key, bytes.as_slice())?;
     Ok(())
+}
+
+fn remove_from_room_index(
+    txn: &redb::WriteTransaction,
+    room: &str,
+    id: u64,
+) -> Result<()> {
+    remove_from_string_index(txn, DRAWERS_BY_ROOM, room, id)
+}
+
+fn remove_from_string_index(
+    txn: &redb::WriteTransaction,
+    table_def: TableDefinition<&'static str, &'static [u8]>,
+    key: &str,
+    id: u64,
+) -> Result<()> {
+    let mut t = txn.open_table(table_def)?;
+    let existing: Vec<u8>;
+    {
+        let fetched = t.get(key)?.map(|v| v.value().to_vec());
+        existing = fetched.unwrap_or_default();
+    }
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let mut ids = decode_u64_list(&existing);
+    ids.retain(|x| *x != id);
+    if ids.is_empty() {
+        t.remove(key)?;
+    } else {
+        t.insert(key, encode_u64_list(&ids).as_slice())?;
+    }
+    Ok(())
+}
+
+fn hex_decode_32(hex: &str) -> Result<[u8; 32]> {
+    if hex.len() != 64 {
+        anyhow::bail!("expected 64 hex chars, got {}", hex.len());
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let pair = &hex[i * 2..i * 2 + 2];
+        out[i] = u8::from_str_radix(pair, 16)
+            .with_context(|| format!("invalid hex at byte {}", i))?;
+    }
+    Ok(out)
 }
 
 /// Extract the set of 3-byte shingles present in a drawer's text.
@@ -1559,6 +2072,185 @@ mod tests {
         assert_eq!(hits[0].importance, 9);
         assert_eq!(hits[1].importance, 7);
         assert_eq!(hits[2].importance, 3);
+    }
+
+    #[test]
+    fn delete_drawer_cascades_across_tables() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        p.ensure_room("arch", None, None).unwrap();
+
+        let d = Drawer {
+            id: 0,
+            text: "switched database engine to postgres".into(),
+            content_hash: String::new(),
+            room: "arch".to_string(),
+            wing: None,
+            importance: 7,
+            source_kind: SourceKind::Project,
+            source_session_id: Some("sess-1".into()),
+            source_file: Some("src/db.rs".into()),
+            source_line: Some(42),
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        };
+        let out = p.insert_drawer_no_embedding(d).unwrap();
+        assert!(!out.deduped);
+        let id = out.id;
+
+        // Link to a sibling.
+        let d2 = Drawer {
+            id: 0,
+            text: "previously used sqlite".into(),
+            content_hash: String::new(),
+            room: "arch".to_string(),
+            wing: None,
+            importance: 5,
+            source_kind: SourceKind::Project,
+            source_session_id: Some("sess-1".into()),
+            source_file: Some("src/db.rs".into()),
+            source_line: Some(10),
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        };
+        let id2 = p.insert_drawer_no_embedding(d2).unwrap().id;
+        p.link_drawers(id, id2, LinkKind::Supersedes).unwrap();
+
+        assert_eq!(p.drawers_for_file("src/db.rs").unwrap().len(), 2);
+        assert_eq!(p.drawers_for_session("sess-1").unwrap().len(), 2);
+        assert!(p.drawer_ids_in_room_public("arch").unwrap().contains(&id));
+        assert!(p.is_superseded(id2).unwrap());
+
+        // Delete id and verify cascade.
+        assert!(p.delete_drawer(id).unwrap());
+        assert!(p.get_drawer(id).unwrap().is_none());
+        assert_eq!(
+            p.drawers_for_file("src/db.rs").unwrap().len(),
+            1,
+            "file xref should drop the deleted drawer"
+        );
+        assert_eq!(
+            p.drawers_for_session("sess-1").unwrap().len(),
+            1,
+            "session xref should drop the deleted drawer"
+        );
+        assert!(
+            !p.drawer_ids_in_room_public("arch").unwrap().contains(&id),
+            "room index should not list the deleted drawer"
+        );
+        assert!(
+            !p.is_superseded(id2).unwrap(),
+            "link should be removed in both directions"
+        );
+
+        // Re-inserting the same text succeeds (content-hash binding was freed).
+        let d3 = Drawer {
+            id: 0,
+            text: "switched database engine to postgres".into(),
+            content_hash: String::new(),
+            room: UNCLASSIFIED_ROOM.to_string(),
+            wing: None,
+            importance: 5,
+            source_kind: SourceKind::Manual,
+            source_session_id: None,
+            source_file: None,
+            source_line: None,
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        };
+        let re = p.insert_drawer_no_embedding(d3).unwrap();
+        assert!(!re.deduped, "should be a fresh insert, not a dedup");
+    }
+
+    #[test]
+    fn update_drawer_changes_room_and_importance() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        p.ensure_room("new-room", None, None).unwrap();
+        let d = Drawer {
+            id: 0,
+            text: "some content".into(),
+            content_hash: String::new(),
+            room: UNCLASSIFIED_ROOM.to_string(),
+            wing: None,
+            importance: 5,
+            source_kind: SourceKind::Manual,
+            source_session_id: None,
+            source_file: None,
+            source_line: None,
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        };
+        let id = p.insert_drawer_no_embedding(d).unwrap().id;
+        let updated = p.update_drawer(id, Some("new-room"), Some(8), None).unwrap();
+        assert_eq!(updated.room, "new-room");
+        assert_eq!(updated.importance, 8);
+        // Room index updated on both sides.
+        assert!(!p
+            .drawer_ids_in_room_public(UNCLASSIFIED_ROOM)
+            .unwrap()
+            .contains(&id));
+        assert!(p
+            .drawer_ids_in_room_public("new-room")
+            .unwrap()
+            .contains(&id));
+    }
+
+    #[test]
+    fn pending_classify_and_score_filter() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        p.ensure_room("arch", None, None).unwrap();
+
+        // classify candidate: unclassified
+        let a = p.insert_drawer_no_embedding(Drawer {
+            id: 0, text: "a".into(), content_hash: String::new(),
+            room: UNCLASSIFIED_ROOM.into(), wing: None, importance: 5,
+            source_kind: SourceKind::Memory, source_session_id: None,
+            source_file: None, source_line: None, source_commit: None,
+            created_at: 0, updated_at: 0, metadata: BTreeMap::new(),
+        }).unwrap();
+        // score candidate: classified, default importance, Memory source
+        let b = p.insert_drawer_no_embedding(Drawer {
+            id: 0, text: "b".into(), content_hash: String::new(),
+            room: "arch".into(), wing: None, importance: 5,
+            source_kind: SourceKind::Memory, source_session_id: None,
+            source_file: None, source_line: None, source_commit: None,
+            created_at: 0, updated_at: 0, metadata: BTreeMap::new(),
+        }).unwrap();
+        // not in either: Manual source at default importance (excluded from score)
+        let c = p.insert_drawer_no_embedding(Drawer {
+            id: 0, text: "c".into(), content_hash: String::new(),
+            room: "arch".into(), wing: None, importance: 5,
+            source_kind: SourceKind::Manual, source_session_id: None,
+            source_file: None, source_line: None, source_commit: None,
+            created_at: 0, updated_at: 0, metadata: BTreeMap::new(),
+        }).unwrap();
+
+        let classify = p.list_pending(PendingOp::Classify, 10).unwrap();
+        assert_eq!(classify.len(), 1);
+        assert_eq!(classify[0].id, a.id);
+
+        // Score candidates: both `a` and `b` have default importance + Memory
+        // source. `c` is excluded because its source is Manual (skill contract
+        // R-732: don't rescore manually-set drawers).
+        let score = p.list_pending(PendingOp::Score, 10).unwrap();
+        let score_ids: std::collections::HashSet<u64> = score.iter().map(|d| d.id).collect();
+        assert_eq!(score.len(), 2);
+        assert!(score_ids.contains(&a.id));
+        assert!(score_ids.contains(&b.id));
+
+        // c is neither pending classify nor score.
+        assert!(classify.iter().all(|d| d.id != c.id));
+        assert!(score.iter().all(|d| d.id != c.id));
     }
 
     #[test]

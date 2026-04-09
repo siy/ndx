@@ -934,6 +934,62 @@ description, rationale.)*
   3rd hook re-injects, and a no-palace cwd silently emits only
   the manifest hints. 24 unit tests green.
 
+- **2026-04-09** — Phase 6 delivered. Conformance check against
+  R-420..R-427, R-470..R-472, R-700..R-763 completed. Full drawer
+  CRUD ships with delete cascade across every satellite table
+  (verified by `delete_drawer_cascades_across_tables` test).
+  `drawer list --pending <op> --json` emits the spec-mandated
+  shape with `op`, `project.existing_rooms`, and `drawers`.
+  Write commands emit `{"ok": true, ...}` JSON envelopes.
+  Five skill files ship via `install.rs` (`ndx-recall-classify`,
+  `-score`, `-dedupe`, `-contradict`, `-summarize`). Install
+  round-trip verified: `ndx init <path>` drops all six files
+  into `<path>/.claude/commands/`. 34 unit tests green (27 recall
+  + 7 pre-existing). End-to-end smoke test exercised every
+  drawer CRUD path, pending-op fetch, cascade on rm.
+
+- **2026-04-09 / Phase 6 / R-702 pagination** — The `cursor` field
+  in the pending-op read schema is always `null` in Phase 6. All
+  batches are one-shot; pagination is added if real deployments
+  produce batches large enough that cursor-style iteration
+  matters. Skill prompts instruct users to re-run `drawer list
+  --pending <op>` until the array is empty, which is semantically
+  equivalent for small-to-medium palaces.
+
+- **2026-04-09 / Phase 6 / R-422 pending heuristics** — The
+  `classify` and `score` `--pending` filters use exact predicates
+  (`room == "unclassified"`, and `importance == 5 AND source_kind
+  != Manual` respectively). The other three filters use v1
+  heuristics that are good enough to drive their skills but
+  refinable:
+    - `dedupe` → drawers sharing a 6-char content-hash prefix
+      with at least one other drawer (quick approximate
+      duplicate cluster finder)
+    - `contradict` → drawers that already participate in any
+      incoming link (pragmatic bootstrap; a v2 would compute
+      trigram-overlap pairs above K trigrams per R-752)
+    - `summarize` → one representative (top importance) drawer
+      per non-empty room
+  None of these is spec-divergent — the spec left the candidate
+  discovery open. Documenting the v1 choices so they can be
+  refined with evidence later.
+
+- **2026-04-09 / Phase 6 / Partial closure of R-1002** — Drawer
+  write commands (`add`/`update`/`rm`/`link`/`unlink`) now emit
+  single JSON objects on success in `--json` mode, matching the
+  R-711..R-714 contracts. Error responses in `--json` mode still
+  go through anyhow/stderr rather than the spec's
+  `{"ok":false,"error":"...","code":N}` envelope — finishing
+  that work is a ≤100-LOC Phase 7 polish item.
+
+- **2026-04-09 / Phase 6 / install.rs restructure** — The
+  install machinery was extended from a single hard-coded
+  `ndx.md` write to a table-driven pass over `SKILL_FILES: &[(&str,
+  &str)]`. The main `ndx.md` skill file was rewritten to
+  document the full recall surface (mining, retrieval,
+  drawer/room/identity CRUD, xref). Adding a future skill is
+  now a one-line change.
+
 - **2026-04-09 / Phase 5 / R-805 interpretation** — The spec text
   for R-805 says "clears the current session's wake_injected
   entry". A plain `ndx recall wake --force` at a shell has no

@@ -542,7 +542,8 @@ fn cmd_init(dir: PathBuf) -> Result<()> {
     let dir = dir.canonicalize().context("invalid directory path")?;
     install::install_skill_to_project(&dir)?;
     eprintln!(
-        "ndx skill installed to {}/.claude/commands/ndx.md",
+        "ndx skills ({} files) installed to {}/.claude/commands/",
+        install::SKILL_FILES.len(),
         dir.display()
     );
     Ok(())
@@ -625,9 +626,14 @@ fn print_recall_usage() {
     eprintln!("  ndx recall mine --from-chroma <chroma-dir> [--wing NAME]");
     eprintln!("  ndx recall mine --project [--path DIR]");
     eprintln!();
-    eprintln!("Drawers (read-only):");
-    eprintln!("  ndx recall drawer list [--room X] [--limit N] [--offset N] [--json]");
+    eprintln!("Drawers:");
+    eprintln!("  ndx recall drawer list [--room X] [--limit N] [--offset N] [--pending <op>] [--json]");
     eprintln!("  ndx recall drawer show --id N [--json]");
+    eprintln!("  ndx recall drawer add \"text\" [--room X] [--importance N] [--source-file F]");
+    eprintln!("  ndx recall drawer update --id N [--room X] [--importance N] [--text \"...\"]");
+    eprintln!("  ndx recall drawer rm --id N");
+    eprintln!("  ndx recall drawer link --from A --to B --kind <references|contradicts|supersedes|derived_from>");
+    eprintln!("  ndx recall drawer unlink --from A --to B [--kind <kind>]");
     eprintln!();
     eprintln!("Retrieval:");
     eprintln!("  ndx recall wake                 Emit L0+L1 wake-up text");
@@ -906,27 +912,189 @@ fn cmd_recall_drawer(args: &[String]) -> Result<()> {
             let room = get_flag(sub_args, "--room");
             let limit = get_flag_usize(sub_args, "--limit").unwrap_or(20);
             let offset = get_flag_usize(sub_args, "--offset").unwrap_or(0);
+            let pending = get_flag(sub_args, "--pending");
+            let json = sub_args.iter().any(|a| a == "--json");
+
+            // --pending overrides --room: returns the batch for a skill.
+            if let Some(pending_name) = pending {
+                let op = recall::PendingOp::parse(pending_name).ok_or_else(|| {
+                    RecallError::usage(format!(
+                        "unknown --pending op `{}`; expected classify|score|dedupe|contradict|summarize",
+                        pending_name
+                    ))
+                })?;
+                let drawers = palace.list_pending(op, limit)?;
+                if json {
+                    let rooms: Vec<String> =
+                        palace.list_rooms()?.into_iter().map(|r| r.name).collect();
+                    let payload = serde_json::json!({
+                        "op": op.as_str(),
+                        "project": {
+                            "path": palace.project_root().display().to_string(),
+                            "existing_rooms": rooms,
+                        },
+                        "drawers": drawers,
+                        "cursor": serde_json::Value::Null,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                } else {
+                    render_drawer_hits(&drawers, false)?;
+                }
+                return Ok(());
+            }
+
             let drawers = palace.list_drawers(room, limit, offset)?;
-            if sub_args.iter().any(|a| a == "--json") {
+            if json {
                 println!("{}", serde_json::to_string_pretty(&drawers)?);
             } else if drawers.is_empty() {
                 println!("(no drawers)");
             } else {
-                for d in &drawers {
-                    let snippet: String = d
-                        .text
-                        .chars()
-                        .take(120)
-                        .collect::<String>()
-                        .replace('\n', " ");
-                    let src = match (&d.source_file, &d.source_session_id) {
-                        (Some(f), _) => format!("  ({})", f),
-                        (None, Some(s)) => format!("  (session: {})", &s[..s.len().min(8)]),
-                        _ => String::new(),
-                    };
-                    println!("[{:>5}] [{}] i={}{}", d.id, d.room, d.importance, src);
-                    println!("        {}", snippet);
-                }
+                render_drawer_hits(&drawers, false)?;
+            }
+            Ok(())
+        }
+        Some("add") => {
+            let text = get_positional(
+                sub_args,
+                &["--room", "--importance", "--source-file", "--source-line"],
+            )
+            .ok_or_else(|| {
+                RecallError::usage(
+                    "usage: ndx recall drawer add \"text\" [--room X] [--importance N] [--source-file F]",
+                )
+            })?;
+            let room = get_flag(sub_args, "--room")
+                .unwrap_or(recall::UNCLASSIFIED_ROOM)
+                .to_string();
+            let importance = get_flag_usize(sub_args, "--importance")
+                .map(|n| n as u8)
+                .unwrap_or(recall::DEFAULT_IMPORTANCE);
+            let source_file = get_flag(sub_args, "--source-file").map(|s| s.to_string());
+            let source_line =
+                get_flag_usize(sub_args, "--source-line").map(|n| n as u32);
+
+            let palace = Palace::open_from_cwd()?;
+            let drawer = recall::Drawer {
+                id: 0,
+                text: text.to_string(),
+                content_hash: String::new(),
+                room,
+                wing: None,
+                importance,
+                source_kind: recall::SourceKind::Manual,
+                source_session_id: None,
+                source_file,
+                source_line,
+                source_commit: None,
+                created_at: 0,
+                updated_at: 0,
+                metadata: std::collections::BTreeMap::new(),
+            };
+            let outcome = palace.insert_drawer(drawer)?;
+            if sub_args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": true, "id": outcome.id, "deduped": outcome.deduped})
+                );
+            } else if outcome.deduped {
+                eprintln!("drawer already existed; bumped importance on id {}", outcome.id);
+            } else {
+                eprintln!("drawer {} added", outcome.id);
+            }
+            Ok(())
+        }
+        Some("update") => {
+            let id = get_flag_usize(sub_args, "--id")
+                .ok_or_else(|| RecallError::usage("usage: ndx recall drawer update --id N [--room X] [--importance N] [--text \"...\"]"))? as u64;
+            let room = get_flag(sub_args, "--room");
+            let importance =
+                get_flag_usize(sub_args, "--importance").map(|n| n as u8);
+            let text = get_flag(sub_args, "--text");
+            if room.is_none() && importance.is_none() && text.is_none() {
+                return Err(RecallError::usage(
+                    "drawer update needs at least one of --room, --importance, --text",
+                )
+                .into());
+            }
+            let palace = Palace::open_from_cwd()?;
+            let updated = palace.update_drawer(id, room, importance, text)?;
+            if sub_args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": true, "id": updated.id})
+                );
+            } else {
+                eprintln!(
+                    "drawer {} updated (room={}, importance={})",
+                    updated.id, updated.room, updated.importance
+                );
+            }
+            Ok(())
+        }
+        Some("rm") => {
+            let id = get_flag_usize(sub_args, "--id")
+                .ok_or_else(|| RecallError::usage("usage: ndx recall drawer rm --id N"))?
+                as u64;
+            let palace = Palace::open_from_cwd()?;
+            let removed = palace.delete_drawer(id)?;
+            if sub_args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": removed, "id": id})
+                );
+            } else if removed {
+                eprintln!("drawer {} removed", id);
+            } else {
+                eprintln!("drawer {} not found", id);
+            }
+            Ok(())
+        }
+        Some("link") => {
+            let from = get_flag_usize(sub_args, "--from")
+                .ok_or_else(|| RecallError::usage("usage: ndx recall drawer link --from A --to B --kind <kind>"))? as u64;
+            let to = get_flag_usize(sub_args, "--to")
+                .ok_or_else(|| RecallError::usage("usage: ndx recall drawer link --from A --to B --kind <kind>"))? as u64;
+            let kind_str = get_flag(sub_args, "--kind").ok_or_else(|| {
+                RecallError::usage("missing --kind (references|contradicts|supersedes|derived_from)")
+            })?;
+            let kind = recall::LinkKind::parse(kind_str).ok_or_else(|| {
+                RecallError::usage(format!(
+                    "unknown link kind `{}`; expected references|contradicts|supersedes|derived_from",
+                    kind_str
+                ))
+            })?;
+            let palace = Palace::open_from_cwd()?;
+            palace.link_drawers(from, to, kind)?;
+            if sub_args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": true, "from": from, "to": to, "kind": kind_str})
+                );
+            } else {
+                eprintln!("linked {} -> {} ({})", from, to, kind_str);
+            }
+            Ok(())
+        }
+        Some("unlink") => {
+            let from = get_flag_usize(sub_args, "--from")
+                .ok_or_else(|| RecallError::usage("usage: ndx recall drawer unlink --from A --to B [--kind <kind>]"))? as u64;
+            let to = get_flag_usize(sub_args, "--to")
+                .ok_or_else(|| RecallError::usage("usage: ndx recall drawer unlink --from A --to B [--kind <kind>]"))? as u64;
+            let kind = match get_flag(sub_args, "--kind") {
+                Some(k) => Some(recall::LinkKind::parse(k).ok_or_else(|| {
+                    RecallError::usage(format!("unknown link kind `{}`", k))
+                })?),
+                None => None,
+            };
+            let palace = Palace::open_from_cwd()?;
+            let removed = palace.unlink_drawers(from, to, kind)?;
+            if sub_args.iter().any(|a| a == "--json") {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": true, "from": from, "to": to, "removed": removed})
+                );
+            } else {
+                eprintln!("unlinked {} -> {} ({} link(s))", from, to, removed);
             }
             Ok(())
         }
