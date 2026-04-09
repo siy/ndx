@@ -21,7 +21,7 @@ detect_platform() {
     case "$os" in
         Darwin) os="macos" ;;
         Linux)  os="linux" ;;
-        *)      error "Unsupported OS: $os" ;;
+        *)      error "Unsupported OS: $os (prebuilt binaries available for macOS and Linux x86_64)" ;;
     esac
 
     case "$arch" in
@@ -30,6 +30,7 @@ detect_platform() {
         *)             error "Unsupported architecture: $arch" ;;
     esac
 
+    # Linux aarch64 doesn't have prebuilts yet — will fall back to source
     echo "ndx-${os}-${arch}"
 }
 
