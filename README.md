@@ -1,6 +1,6 @@
 # ndx
 
-Fast file index with trigram search, real-time file watching, episodic memory, and command hooks. Single Rust binary, zero external dependencies. Runs as a background daemon with a thin CLI client.
+Fast file index with trigram search, real-time file watching, episodic memory, **recall palace** (structured per-project memory with hybrid semantic + lexical search), and command hooks. Single Rust binary, one optional model download. Runs as a background daemon for the file index and direct-access for memory and recall.
 
 ## Features
 
@@ -9,14 +9,16 @@ Fast file index with trigram search, real-time file watching, episodic memory, a
 - **Real-time updates** — background daemon with filesystem watcher re-indexes on create/modify/delete
 - **Gitignore-aware** — respects `.gitignore` rules, rebuilds matcher on changes
 - **Episodic memory** — indexes AI coding session transcripts for full-text search across past sessions
-- **Command hooks** — PreToolUse hook injects CLI syntax hints and filters noisy output
-- **Cross-referencing** — bridges file index and session memory ("which sessions touched this file?")
+- **Recall palace** — per-project structured memory with rooms, drawers, 4-layer retrieval ladder (identity → wake-up → room-filtered → hybrid search), local embeddings via `fastembed` + `all-MiniLM-L6-v2`
+- **Hybrid search** — semantic (cosine) + lexical (trigram) fused via RRF; wins over either alone on both exact identifiers and synonyms
+- **Command hooks** — PreToolUse hook injects CLI syntax hints, filters noisy output, and auto-injects wake-up context once per Claude session
+- **Cross-referencing** — bridges file index, session memory, and recall palace ("which drawers touched this file?", "which drawers came from this commit?")
 - **Subagent-friendly** — pure CLI interface works from any context, including Claude Code subagents and team members
-- **Zero configuration** — single binary, no JVM, no Node.js, no external services
+- **Claude-curated quality** — five slash commands (`/ndx-recall-classify`, `-score`, `-dedupe`, `-contradict`, `-summarize`) delegate judgment work to Claude instead of brittle heuristics
 
 ## Architecture
 
-ndx uses a daemon+client architecture:
+ndx mixes a daemon+client architecture for the hot file index with direct-access storage for memory and recall:
 
 ```
 CLI (ndx search/list/find/status)
@@ -26,13 +28,20 @@ CLI (ndx search/list/find/status)
                        ├─ watcher (debounced real-time updates)
                        └─ query engine (trigram search)
 
-CLI (ndx memory/xref)
-  └─ direct access ──► memory.redb
+CLI (ndx memory/xref file/session)
+  └─ direct access ──► ~/.ndx/memory.redb
+
+CLI (ndx recall *, ndx xref drawer/drawer-session/git)
+  └─ direct access ──► {project}/.ndx/recall.redb
+                          ├─ drawers + trigrams + embeddings
+                          ├─ rooms + links
+                          ├─ file/session/commit cross-references
+                          └─ wake-up injection state
 ```
 
-The daemon auto-starts on the first index query and stays alive until `ndx stop`. It owns the project index exclusively, keeps it current via filesystem watcher, and serves queries over a Unix domain socket (`.ndx/ndx.sock`).
+The daemon auto-starts on the first file-index query and stays alive until `ndx stop`. It owns the project index exclusively, keeps it current via filesystem watcher, and serves queries over a Unix domain socket (`.ndx/ndx.sock`).
 
-Memory commands access the global memory database directly — no daemon needed.
+Memory and recall commands access their databases directly — no daemon needed. The embedding model (`all-MiniLM-L6-v2`, ~90 MiB) downloads on first semantic operation and caches in `~/.ndx/models/`.
 
 ## Installation
 
@@ -110,11 +119,82 @@ ndx memory tree <session-id>                     # session + subagent tree
 
 All memory commands accept `--limit N`.
 
+### Recall palace commands
+
+Per-project structured memory (`{project}/.ndx/recall.redb`). Drawers are atomic memory units grouped into rooms, retrievable via a 4-layer ladder plus hybrid semantic + lexical search. Direct access, no daemon.
+
+#### Lifecycle
+
+```sh
+ndx recall init                             # create the palace
+ndx recall status [--json]                  # counts, schema, embedding model, last mine
+ndx recall reembed [--force]                # backfill embeddings (downloads model if needed)
+```
+
+#### Mining — fill the palace
+
+```sh
+ndx recall mine --from-memory [--since 2026-01-01]   # derive from global session memory
+ndx recall mine --from-chroma <path>                 # import from a mempalace ChromaDB
+ndx recall mine --project [--path <dir>]             # walk the project, paragraph-chunk text files
+```
+
+All mine modes are idempotent via BLAKE3 content-hash dedup; re-running yields `added: 0, deduped: N`.
+
+#### Retrieval — the 4-layer ladder
+
+```sh
+ndx recall wake [--force]                   # L0 identity + L1 top drawers → stdout (wake-up text)
+ndx recall get --room <name> [--limit N]    # L2 metadata retrieval
+ndx recall search "query" [flags]           # L3 hybrid (default), --semantic, --lexical
+ndx recall search "query" --room decisions --limit 5
+```
+
+L3 defaults to **hybrid search**: fastembed cosine similarity (top-50) fused with trigram intersection (top-50) via Reciprocal Rank Fusion (k=60). Semantic catches synonyms; lexical catches exact identifiers. Neither alone is sufficient.
+
+#### Drawers
+
+```sh
+ndx recall drawer list [--room X] [--limit N] [--pending <op>] [--json]
+ndx recall drawer show --id N [--json]
+ndx recall drawer add "text" [--room X] [--importance N] [--source-file F]
+ndx recall drawer update --id N [--room X] [--importance N] [--text "..."]
+ndx recall drawer rm --id N                # full cascade across all indexes
+ndx recall drawer link --from A --to B --kind <references|contradicts|supersedes|derived_from>
+ndx recall drawer unlink --from A --to B [--kind <kind>]
+```
+
+#### Rooms and identity
+
+```sh
+ndx recall room add <name> [--title T] [--description D]
+ndx recall room list | show <name> | rename <old> <new> | rm <name>
+ndx recall identity show [--merged]         # render merged global + per-project identity.toml
+ndx recall identity edit [--project]        # $EDITOR on the identity file (creates template)
+```
+
+#### Claude-curated maintenance (slash commands)
+
+The palace stores everything raw. Quality is curated via five slash commands that delegate judgment to Claude Code and round-trip through `ndx recall drawer update|link|rm --json`:
+
+| Command | Purpose |
+|---|---|
+| `/ndx-recall-classify` | assign rooms to `unclassified` drawers |
+| `/ndx-recall-score` | set meaningful importance on default-5 drawers |
+| `/ndx-recall-dedupe` | merge near-duplicates (cluster by content-hash prefix) |
+| `/ndx-recall-contradict` | flag contradictions and link via `LinkKind::Contradicts` |
+| `/ndx-recall-summarize` | generate per-room summary drawers in the reserved `_summary_` room |
+
+Each skill fetches a batch via `ndx recall drawer list --pending <op> --limit N --json`, decides what to do, and writes back with individual update commands.
+
 ### Cross-reference commands
 
 ```sh
 ndx xref file src/main.rs               # find sessions that touched this file
 ndx xref session <session-id>           # list files touched by a session
+ndx xref drawer src/auth.rs             # find palace drawers referencing a file
+ndx xref drawer-session <session-id>    # drawers derived from a session
+ndx xref git <commit>                   # drawers referencing files changed in a commit (cached)
 ```
 
 ### Daemon commands
@@ -164,9 +244,13 @@ ndx uses the same YAML manifest format as [kcp-commands](https://github.com/Cant
 | Database | Location | Contents |
 |----------|----------|----------|
 | Project index | `{project}/.ndx/index.redb` | File metadata, trigram content index |
+| Recall palace | `{project}/.ndx/recall.redb` | Drawers, rooms, links, embeddings, trigrams, xrefs, wake state |
+| Per-project identity | `{project}/.ndx/identity.toml` | Optional per-project identity override (TOML) |
 | Daemon socket | `{project}/.ndx/ndx.sock` | Unix domain socket for client-daemon IPC |
 | Daemon log | `{project}/.ndx/ndx.log` | Daemon stderr output |
 | Global memory | `~/.ndx/memory.redb` | Sessions, events, agents, cross-references |
+| Global identity | `~/.ndx/identity.toml` | Base identity file (TOML), merged with project override |
+| Embedding model | `~/.ndx/models/` | Cached `all-MiniLM-L6-v2` ONNX model (~90 MiB, downloaded on first use) |
 | Manifests | `~/.ndx/commands/*.yaml` | Command syntax and filter definitions |
 
 ## Environment Variables
@@ -175,7 +259,7 @@ ndx uses the same YAML manifest format as [kcp-commands](https://github.com/Cant
 
 ## Acknowledgments
 
-ndx's episodic memory and command manifest features are inspired by and compatible with:
+ndx's episodic memory, command manifest, and recall palace features are inspired by and compatible with:
 
 - **[kcp-commands](https://github.com/Cantara/kcp-commands)** — Command syntax injection and output filtering for AI coding agents. Created by [Cantara](https://github.com/Cantara). ndx uses the same YAML manifest format and downloads the same bundled manifests (289 commands covering git, docker, kubectl, cloud CLIs, build tools, and more).
 
@@ -183,4 +267,6 @@ ndx's episodic memory and command manifest features are inspired by and compatib
 
 - **[Knowledge Context Protocol](https://github.com/Cantara/knowledge-context-protocol)** — The KCP specification that defines the manifest format and integration patterns.
 
-Both kcp-commands and kcp-memory are licensed under [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0). ndx is an independent Rust implementation of the same concepts and protocols. The YAML manifest files downloaded by `ndx install` are redistributed from kcp-commands under their original Apache 2.0 license.
+- **[mempalace](https://github.com/milla-jovovich/mempalace)** — The structured memory palace concept (wings, rooms, drawers, 4-layer retrieval ladder, raw verbatim storage) that inspired ndx's `recall` subsystem. Created by [milla-jovovich & Ben Sigman](https://github.com/milla-jovovich). ndx re-implements the useful ideas in Rust on top of `redb` and `fastembed`, deliberately omitting mempalace's AAAK compression layer and MCP server. The 4-layer retrieval ladder, the importance-weighted taxonomy, and the `all-MiniLM-L6-v2` embedding choice (for benchmark parity) come directly from mempalace.
+
+kcp-commands and kcp-memory are licensed under [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0). mempalace is licensed under MIT. ndx is an independent Rust implementation of the same concepts and protocols. The YAML manifest files downloaded by `ndx install` are redistributed from kcp-commands under their original Apache 2.0 license.
