@@ -649,6 +649,7 @@ fn print_recall_usage() {
 fn cmd_recall_init() -> Result<()> {
     let root = recall::current_project_root()?;
     let _palace = Palace::create_at(root.clone())?;
+    install::ensure_gitignore_entry(&root)?;
     eprintln!(
         "recall palace initialized at {}/.ndx/recall.redb",
         root.display()

@@ -417,7 +417,29 @@ pub fn run_install() -> Result<()> {
 /// Install the ndx skill into a specific project directory.
 pub fn install_skill_to_project(project_dir: &Path) -> Result<()> {
     let skill_dir = project_dir.join(".claude").join("commands");
-    install_skill(&skill_dir)
+    install_skill(&skill_dir)?;
+    ensure_gitignore_entry(project_dir)?;
+    Ok(())
+}
+
+/// Append `.ndx/` to the project's `.gitignore` if not already present.
+/// Creates the file if it doesn't exist. Idempotent.
+pub fn ensure_gitignore_entry(project_dir: &Path) -> Result<()> {
+    let gitignore = project_dir.join(".gitignore");
+    let entry = ".ndx/";
+
+    if gitignore.exists() {
+        let content = std::fs::read_to_string(&gitignore)?;
+        if content.lines().any(|l| l.trim() == entry) {
+            return Ok(()); // already present
+        }
+        // Append with a preceding newline if the file doesn't end with one.
+        let prefix = if content.ends_with('\n') { "" } else { "\n" };
+        std::fs::write(&gitignore, format!("{}{}{}\n", content, prefix, entry))?;
+    } else {
+        std::fs::write(&gitignore, format!("{}\n", entry))?;
+    }
+    Ok(())
 }
 
 /// The complete set of skill files shipped by `ndx install` and

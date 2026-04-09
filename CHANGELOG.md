@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.1 — QoL: auto-gitignore .ndx/
+
+- `ndx init` and `ndx recall init` now automatically add `.ndx/` to the project's `.gitignore` (creates the file if absent, idempotent on re-run)
+
 ## v0.5.0 — Recall: Structured Episodic Memory Palace
 
 Released 2026-04-09. Design spec: [`docs/specs/recall.md`](docs/specs/recall.md).
