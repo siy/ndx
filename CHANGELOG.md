@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.0 — Auto-discovery, prebuilt binaries, CLAUDE.md integration
+
+### Added
+- `ndx init` now appends an ndx section to the project's `CLAUDE.md` — Claude automatically discovers ndx, its skills, and key commands without manual configuration
+- `install.sh` downloads prebuilt binaries from GitHub Releases (macOS ARM64/x86_64, Linux x86_64/aarch64), falls back to source build if unavailable
+- "Recall Palace Workflow" section in README with step-by-step lifecycle guide
+- `/ndx-recall-handover` skill — session knowledge handover to save durable insights as memories
+
+### Changed
+- `install.sh` rewritten: prebuilt-first instead of source-only
+- README installation section updated with prebuilt download path
+- 7 skill files now ship with `ndx install` / `ndx init`
+
 ## v0.5.3 — Workflow docs, curl installer, handover skill
 
 - Added "Recall Palace Workflow" section to README with step-by-step lifecycle guide

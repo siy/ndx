@@ -170,17 +170,25 @@ Work through the current project's recall palace and assign each unclassified dr
    Read each drawer's `text`. Assign the best-fitting room. Prefer existing rooms from `project.existing_rooms` when one fits; create new rooms only when none match.
    Good room names: lowercase, `[a-z0-9_-]+`, ≤64 chars. Examples: `architecture`, `decisions`, `people`, `tools`, `bugs`, `glossary`, `rationale`, `setup`.
 
-3. **Apply classifications**
-   For each drawer:
+3. **Bulk-classify by source file first**
+   Before classifying individual drawers, check if whole-file moves save work:
+   ```bash
+   ndx recall drawer update --source-file CHANGELOG.md --room releases
+   ndx recall drawer update --source-file docs/specs/ --room architecture
+   ndx recall drawer update --source-file CLAUDE.md --room conventions
+   ```
+   This moves all drawers from a source file (or path prefix) to a room in one command. Re-fetch the pending batch after bulk moves to see what remains.
+
+4. **Classify remaining drawers individually**
    ```bash
    ndx recall drawer update --id <N> --room <room> --json
    ```
-   `drawer update` auto-creates the target room if it doesn't exist yet. Optionally give a new room a title/description:
+   `drawer update` auto-creates the target room. Optionally add titles:
    ```bash
    ndx recall room add <name> --title "..." --description "..."
    ```
 
-4. **Handle noise**
+5. **Handle noise**
    If a drawer is pure noise (markdown separator, single punctuation, boilerplate header), delete it instead:
    ```bash
    ndx recall drawer rm --id <N>
@@ -469,6 +477,41 @@ pub fn install_skill_to_project(project_dir: &Path) -> Result<()> {
     let skill_dir = project_dir.join(".claude").join("commands");
     install_skill(&skill_dir)?;
     ensure_gitignore_entry(project_dir)?;
+    ensure_claude_md_ndx_section(project_dir)?;
+    Ok(())
+}
+
+const CLAUDE_MD_NDX_SECTION: &str = r#"
+## ndx
+
+`ndx` is available in this project. Use `/ndx` for full CLI reference.
+
+Key commands: `ndx recall search "query"` (hybrid search), `ndx recall wake` (context), `ndx xref drawer <file>` (cross-ref).
+
+Skills: `/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`, `/ndx-recall-summarize`, `/ndx-recall-handover`.
+
+If recall palace is not initialized, run `ndx recall init` then `ndx recall mine --from-memory`.
+"#;
+
+/// Append an ndx section to the project's `CLAUDE.md` if not already
+/// present. Creates the file if it doesn't exist. Idempotent.
+pub fn ensure_claude_md_ndx_section(project_dir: &Path) -> Result<()> {
+    let claude_md = project_dir.join("CLAUDE.md");
+    let marker = "## ndx";
+
+    if claude_md.exists() {
+        let content = std::fs::read_to_string(&claude_md)?;
+        if content.contains(marker) {
+            return Ok(()); // already present
+        }
+        let prefix = if content.ends_with('\n') { "" } else { "\n" };
+        std::fs::write(
+            &claude_md,
+            format!("{}{}{}", content, prefix, CLAUDE_MD_NDX_SECTION),
+        )?;
+    } else {
+        std::fs::write(&claude_md, CLAUDE_MD_NDX_SECTION.trim_start())?;
+    }
     Ok(())
 }
 

@@ -1005,12 +1005,40 @@ fn cmd_recall_drawer(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("update") => {
-            let id = get_flag_usize(sub_args, "--id")
-                .ok_or_else(|| RecallError::usage("usage: ndx recall drawer update --id N [--room X] [--importance N] [--text \"...\"]"))? as u64;
+            let source_file = get_flag(sub_args, "--source-file");
+            let id = get_flag_usize(sub_args, "--id");
             let room = get_flag(sub_args, "--room");
             let importance =
                 get_flag_usize(sub_args, "--importance").map(|n| n as u8);
             let text = get_flag(sub_args, "--text");
+
+            // Bulk mode: --source-file + --room (no --id needed).
+            if let Some(sf) = source_file {
+                let target_room = room.ok_or_else(|| {
+                    RecallError::usage(
+                        "bulk update needs --room: ndx recall drawer update --source-file <path> --room <room>",
+                    )
+                })?;
+                let palace = Palace::open_from_cwd()?;
+                let count = palace.bulk_update_by_source_file(sf, target_room, importance)?;
+                if sub_args.iter().any(|a| a == "--json") {
+                    println!(
+                        "{}",
+                        serde_json::json!({"ok": true, "updated": count, "source_file": sf, "room": target_room})
+                    );
+                } else {
+                    eprintln!(
+                        "{} drawers from `{}` moved to room `{}`",
+                        count, sf, target_room
+                    );
+                }
+                return Ok(());
+            }
+
+            // Single-drawer mode: --id required.
+            let id = id.ok_or_else(|| RecallError::usage(
+                "usage: ndx recall drawer update --id N [--room X] [--importance N] [--text \"...\"]  OR  --source-file <path> --room <room>",
+            ))? as u64;
             if room.is_none() && importance.is_none() && text.is_none() {
                 return Err(RecallError::usage(
                     "drawer update needs at least one of --room, --importance, --text",

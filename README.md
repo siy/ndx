@@ -45,17 +45,17 @@ Memory and recall commands access their databases directly — no daemon needed.
 
 ## Installation
 
-### Quick install (from source)
-
-Requires [Rust](https://rustup.rs/) 1.70+ and git.
+### Quick install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/siy/ndx/master/install.sh | bash
 ```
 
-This clones, builds the release binary, copies it to `~/.local/bin/ndx`, downloads 289 command manifests, registers the PreToolUse hook, and installs 7 slash commands (`/ndx`, `/ndx-recall-classify`, `-score`, `-dedupe`, `-contradict`, `-summarize`, `-handover`). Restart Claude Code after install.
+Downloads a prebuilt binary from [GitHub Releases](https://github.com/siy/ndx/releases) (macOS ARM64/x86_64, Linux x86_64/aarch64). Falls back to building from source if no prebuilt is available. Installs to `~/.local/bin/ndx`, downloads 289 command manifests, registers the PreToolUse hook, and installs 7 slash commands. Restart Claude Code after install.
 
-### Manual install
+### From source
+
+Requires [Rust](https://rustup.rs/) 1.70+.
 
 ```sh
 git clone https://github.com/siy/ndx.git
@@ -69,13 +69,17 @@ ndx install
 
 ```sh
 cd /path/to/your/project
-ndx init                    # installs 7 skill files + adds .ndx/ to .gitignore
+ndx init                    # installs 7 skill files + .gitignore + CLAUDE.md ndx section
 ndx recall init             # creates the recall palace (.ndx/recall.redb)
 ```
 
 ## Recall Palace Workflow
 
 The recall palace is a per-project structured memory that stores decisions, rationale, architecture, and context — everything that disappears when a session ends. Here's the recommended lifecycle:
+
+### 0. Introduce ndx to Claude
+
+After `ndx init`, Claude Code sees the `/ndx` slash command which documents the full CLI surface. This is the discovery mechanism — Claude reads it and knows what ndx can do. From that point on, Claude can proactively suggest ndx commands, use recall search to find context, and run the maintenance skills without manual prompting. The tight integration flows from this one file.
 
 ### 1. Seed the palace
 

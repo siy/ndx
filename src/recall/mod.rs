@@ -1373,6 +1373,50 @@ impl Palace {
         Ok(filtered)
     }
 
+    // ── Bulk operations ──
+
+    /// Update room (and optionally importance) for all drawers matching
+    /// a `source_file` prefix. Returns the count of drawers updated.
+    /// Used by the classify skill for batch-by-file workflows.
+    pub fn bulk_update_by_source_file(
+        &self,
+        source_file: &str,
+        new_room: &str,
+        new_importance: Option<u8>,
+    ) -> Result<u64> {
+        validate_room_name(new_room)?;
+        if let Some(i) = new_importance {
+            if !(1..=10).contains(&i) {
+                return Err(RecallError::usage("importance must be in 1..=10").into());
+            }
+        }
+
+        // Collect matching ids. We match both exact and prefix so that
+        // `--source-file docs/` covers all files under docs/.
+        let all = self.list_drawers(None, usize::MAX, 0)?;
+        let matching_ids: Vec<u64> = all
+            .iter()
+            .filter(|d| {
+                d.source_file
+                    .as_deref()
+                    .map(|f| f == source_file || f.starts_with(source_file))
+                    .unwrap_or(false)
+            })
+            .map(|d| d.id)
+            .collect();
+
+        if matching_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut count = 0u64;
+        for id in matching_ids {
+            self.update_drawer(id, Some(new_room), new_importance, None)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     // ── Wake-up injection state (Phase 5 / R-160 series) ──
 
     /// Return true if wake-up text has already been injected into the

@@ -137,7 +137,62 @@ fn extract_turn_pairs(path: &Path) -> Result<Vec<String>> {
     if let Some(u) = pending_user.take() {
         pairs.push(format_pair(&u, ""));
     }
-    Ok(pairs)
+    // Filter: keep only high-signal turns, drop assistant narration noise.
+    Ok(pairs.into_iter().filter(|p| is_high_signal_turn(p)).collect())
+}
+
+/// Heuristic signal filter for session turn-pairs. Returns true for turns
+/// that likely contain decisions, rationale, outcomes, or user corrections.
+/// Returns false for mechanical assistant narration ("Let me read...",
+/// "Now I'll check...") and trivial user continuations ("ok", "yes").
+fn is_high_signal_turn(text: &str) -> bool {
+    // Very short turns are almost always noise ("ok", "yes", "go ahead").
+    if text.len() < 40 {
+        return false;
+    }
+
+    // Positive signals: decision/rationale markers in either role.
+    const KEEP_MARKERS: &[&str] = &[
+        "decided", "chose", "chosen", "because", "rationale", "reason",
+        "trade-off", "tradeoff", "instead of", "rather than", "prefer",
+        "should", "must", "won't", "don't", "never", "always",
+        "switched", "migrated", "replaced", "deprecated", "removed",
+        "bug", "fix", "broke", "regression", "root cause",
+        "design", "architecture", "pattern", "convention",
+        "important", "critical", "requirement", "constraint",
+        "learned", "surprised", "mistake", "corrected",
+    ];
+
+    let lower = text.to_ascii_lowercase();
+
+    // If it contains a decision/rationale marker, keep it.
+    if KEEP_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+
+    // Negative signals: assistant narration openers.
+    const NOISE_PREFIXES: &[&str] = &[
+        "assistant: let me ",
+        "assistant: now let me ",
+        "assistant: now i'll ",
+        "assistant: i'll read ",
+        "assistant: i'll check ",
+        "assistant: i'll look ",
+        "assistant: looking at ",
+        "assistant: reading ",
+        "assistant: checking ",
+        "assistant: running ",
+        "assistant: the file ",
+        "assistant: here's the ",
+        "assistant: here is the ",
+    ];
+
+    if NOISE_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return false;
+    }
+
+    // Default: keep (err on the side of retention for medium-length turns).
+    true
 }
 
 fn format_pair(user: &str, assistant: &str) -> String {
@@ -403,12 +458,13 @@ pub fn mine_project(palace: &Palace, scan_root: Option<&Path>) -> Result<MineRep
             .to_string_lossy()
             .into_owned();
 
+        let auto_room = infer_room_from_path(&rel);
         for (text, line) in split_paragraphs(&content) {
             staged.push(Drawer {
                 id: 0,
                 text,
                 content_hash: String::new(),
-                room: UNCLASSIFIED_ROOM.to_string(),
+                room: auto_room.clone(),
                 wing: None,
                 importance: DEFAULT_IMPORTANCE,
                 source_kind: SourceKind::Project,
@@ -497,6 +553,42 @@ fn split_sentences(text: &str) -> Vec<String> {
     out
 }
 
+/// Map well-known filenames and directory patterns to rooms so that
+/// `mine --project` produces pre-classified drawers instead of dumping
+/// everything into `unclassified`. Returns the room name.
+fn infer_room_from_path(rel_path: &str) -> String {
+    let lower = rel_path.to_ascii_lowercase();
+    let basename = std::path::Path::new(rel_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    // Exact filename matches.
+    match basename.as_str() {
+        "changelog.md" | "changes.md" | "history.md" => return "releases".into(),
+        "claude.md" => return "conventions".into(),
+        "readme.md" => return "overview".into(),
+        "contributing.md" | "code_of_conduct.md" => return "conventions".into(),
+        "architecture.md" | "design.md" => return "architecture".into(),
+        "security.md" => return "security".into(),
+        "license" | "license.md" | "license.txt" => return "overview".into(),
+        _ => {}
+    }
+
+    // Directory-based inference.
+    if lower.starts_with("proposals/") || lower.starts_with("rfcs/") || lower.starts_with("rfc/") {
+        return "proposals".into();
+    }
+    if lower.starts_with("docs/specs/") || lower.starts_with("spec/") || lower.starts_with("specs/") {
+        return "architecture".into();
+    }
+    if lower.starts_with("docs/") || lower.starts_with("doc/") {
+        return "documentation".into();
+    }
+
+    UNCLASSIFIED_ROOM.into()
+}
+
 /// Reject binary files and common noise (R-624).
 fn is_mineable(path: &Path) -> bool {
     // Extension denylist.
@@ -550,6 +642,32 @@ mod tests {
         assert_eq!(format_pair("q", ""), "USER: q");
         assert_eq!(format_pair("", "a"), "ASSISTANT: a");
         assert_eq!(format_pair("", ""), "");
+    }
+
+    #[test]
+    fn signal_filter_keeps_decisions_drops_narration() {
+        assert!(is_high_signal_turn(
+            "USER: We decided to use Postgres because of JSONB support"
+        ));
+        assert!(is_high_signal_turn(
+            "USER: switched from REST to GraphQL\n\nASSISTANT: That's a significant architecture change"
+        ));
+        assert!(!is_high_signal_turn("USER: ok"));
+        assert!(!is_high_signal_turn("USER: yes"));
+        assert!(!is_high_signal_turn(
+            "ASSISTANT: Let me read the file and check."
+        ));
+    }
+
+    #[test]
+    fn auto_room_from_path() {
+        assert_eq!(infer_room_from_path("CHANGELOG.md"), "releases");
+        assert_eq!(infer_room_from_path("CLAUDE.md"), "conventions");
+        assert_eq!(infer_room_from_path("README.md"), "overview");
+        assert_eq!(infer_room_from_path("docs/specs/recall.md"), "architecture");
+        assert_eq!(infer_room_from_path("proposals/auth-rfc.md"), "proposals");
+        assert_eq!(infer_room_from_path("docs/guide.md"), "documentation");
+        assert_eq!(infer_room_from_path("src/main.rs"), "unclassified");
     }
 
     #[test]
