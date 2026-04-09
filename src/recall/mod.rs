@@ -650,9 +650,7 @@ impl Palace {
             }
         }
         if input.text.len() > MAX_DRAWER_TEXT_BYTES {
-            input
-                .text
-                .truncate(MAX_DRAWER_TEXT_BYTES.saturating_sub(16));
+            safe_truncate(&mut input.text, MAX_DRAWER_TEXT_BYTES.saturating_sub(16));
             input.text.push_str("… [truncated]");
         }
         let hash = blake3::hash(input.text.as_bytes());
@@ -993,7 +991,7 @@ impl Palace {
         if let Some(t) = new_text {
             drawer.text = t.to_string();
             if drawer.text.len() > MAX_DRAWER_TEXT_BYTES {
-                drawer.text.truncate(MAX_DRAWER_TEXT_BYTES.saturating_sub(16));
+                safe_truncate(&mut drawer.text, MAX_DRAWER_TEXT_BYTES.saturating_sub(16));
                 drawer.text.push_str("… [truncated]");
             }
             let h = blake3::hash(drawer.text.as_bytes());
@@ -1905,6 +1903,33 @@ pub fn extract_drawer_trigrams(text: &str) -> HashSet<[u8; 3]> {
 /// Extract unique query trigrams for L3 lexical lookup.
 pub fn extract_query_trigrams(query: &str) -> HashSet<[u8; 3]> {
     extract_drawer_trigrams(query)
+}
+
+/// Truncate a `String` in place at the nearest char boundary at or
+/// before `max_bytes`. Avoids panics from `String::truncate` when the
+/// byte offset falls inside a multi-byte UTF-8 character.
+pub fn safe_truncate(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
+/// Return the longest prefix of `s` that fits within `max_bytes` without
+/// splitting a multi-byte character. Safe replacement for `&s[..n]`.
+pub fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 pub fn validate_room_name(name: &str) -> Result<()> {

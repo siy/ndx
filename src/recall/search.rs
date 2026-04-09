@@ -250,7 +250,7 @@ fn source_hint(d: &Drawer) -> String {
         return format!("src: {}", short);
     }
     if let Some(sid) = &d.source_session_id {
-        return format!("session: {}", &sid[..sid.len().min(8)]);
+        return format!("session: {}", crate::recall::safe_prefix(sid, 8));
     }
     String::new()
 }

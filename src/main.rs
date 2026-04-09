@@ -356,7 +356,7 @@ fn render_drawer_hits(hits: &[recall::Drawer], json: bool) -> Result<()> {
             .replace('\n', " ");
         let src = match (&d.source_file, &d.source_session_id) {
             (Some(f), _) => format!("  src: {}", f),
-            (None, Some(s)) => format!("  session: {}", &s[..s.len().min(8)]),
+            (None, Some(s)) => format!("  session: {}", recall::safe_prefix(s, 8)),
             _ => String::new(),
         };
         println!("[{:>5}] [{}] i={}{}", d.id, d.room, d.importance, src);
@@ -412,7 +412,7 @@ fn cmd_hook() -> Result<()> {
                     session_id: hook_input.session_id.unwrap_or_default(),
                     project_dir: hook_input.cwd.unwrap_or_default(),
                     tool: "Bash".to_string(),
-                    command: command[..command.len().min(500)].to_string(),
+                    command: recall::safe_prefix(command, 500).to_string(),
                     manifest_key,
                     ingested_at: chrono::Utc::now().to_rfc3339(),
                 };
@@ -460,7 +460,7 @@ fn try_inject_wake_up(
     let wake_text = recall::search::wake_up(&palace)?;
     let block = format!(
         "# ndx-recall wake-up (session {})\n{}\n# /wake-up\n",
-        &session_id[..session_id.len().min(8)],
+        recall::safe_prefix(session_id, 8),
         wake_text.trim_end()
     );
 
@@ -1299,7 +1299,7 @@ fn cmd_recall_search(args: &[String]) -> Result<()> {
         if let Some(f) = &hit.drawer.source_file {
             println!("    src: {}", f);
         } else if let Some(s) = &hit.drawer.source_session_id {
-            println!("    session: {}", &s[..s.len().min(8)]);
+            println!("    session: {}", recall::safe_prefix(s, 8));
         }
     }
     Ok(())
