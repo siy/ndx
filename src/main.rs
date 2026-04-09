@@ -420,6 +420,10 @@ fn cmd_recall(args: &[String]) -> Result<()> {
         Some("identity") => cmd_recall_identity(sub_args),
         Some("mine") => cmd_recall_mine(sub_args),
         Some("drawer") => cmd_recall_drawer(sub_args),
+        Some("wake") => cmd_recall_wake(sub_args),
+        Some("get") => cmd_recall_get(sub_args),
+        Some("search") => cmd_recall_search(sub_args),
+        Some("reembed") => cmd_recall_reembed(sub_args),
         Some(other) => Err(RecallError::usage(format!(
             "unknown recall subcommand `{}`. Run `ndx help` for usage.",
             other
@@ -451,9 +455,15 @@ fn print_recall_usage() {
     eprintln!("  ndx recall mine --from-chroma <chroma-dir> [--wing NAME]");
     eprintln!("  ndx recall mine --project [--path DIR]");
     eprintln!();
-    eprintln!("Drawers (read-only in Phase 2):");
+    eprintln!("Drawers (read-only):");
     eprintln!("  ndx recall drawer list [--room X] [--limit N] [--offset N] [--json]");
     eprintln!("  ndx recall drawer show --id N [--json]");
+    eprintln!();
+    eprintln!("Retrieval:");
+    eprintln!("  ndx recall wake                 Emit L0+L1 wake-up text");
+    eprintln!("  ndx recall get --room X [--limit N] [--json]");
+    eprintln!("  ndx recall search \"query\" [--room X] [--limit N] [--lexical|--semantic|--hybrid] [--json]");
+    eprintln!("  ndx recall reembed [--force]    Backfill embeddings (downloads model if needed)");
     eprintln!();
     eprintln!("Identity:");
     eprintln!("  ndx recall identity show [--merged]");
@@ -798,6 +808,133 @@ fn cmd_recall_drawer(args: &[String]) -> Result<()> {
         )
         .into()),
     }
+}
+
+fn cmd_recall_wake(_args: &[String]) -> Result<()> {
+    let palace = Palace::open_from_cwd()?;
+    let text = recall::search::wake_up(&palace)?;
+    println!("{}", text);
+    Ok(())
+}
+
+fn cmd_recall_get(args: &[String]) -> Result<()> {
+    let room = get_flag(args, "--room")
+        .ok_or_else(|| RecallError::usage("usage: ndx recall get --room <name> [--limit N]"))?;
+    let limit = get_flag_usize(args, "--limit").unwrap_or(10);
+    let palace = Palace::open_from_cwd()?;
+    let drawers = palace.list_drawers(Some(room), limit, 0)?;
+
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&drawers)?);
+        return Ok(());
+    }
+    if drawers.is_empty() {
+        println!("(no drawers in room `{}`)", room);
+        return Ok(());
+    }
+    // Order by importance desc, updated_at desc (R-522).
+    let mut sorted = drawers;
+    sorted.sort_by(|a, b| {
+        b.importance
+            .cmp(&a.importance)
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+    for d in sorted {
+        let snippet: String = d
+            .text
+            .chars()
+            .take(300)
+            .collect::<String>()
+            .replace('\n', " ");
+        println!("[{:>5}] i={}  {}", d.id, d.importance, snippet);
+    }
+    Ok(())
+}
+
+fn cmd_recall_search(args: &[String]) -> Result<()> {
+    let query = get_positional(
+        args,
+        &["--room", "--limit", "--lexical", "--semantic", "--hybrid", "--json"],
+    )
+    .ok_or_else(|| RecallError::usage("usage: ndx recall search \"query\" [flags]"))?;
+
+    let room = get_flag(args, "--room");
+    let limit = get_flag_usize(args, "--limit").unwrap_or(recall::search::DEFAULT_N_OUT);
+
+    let lexical = args.iter().any(|a| a == "--lexical");
+    let semantic = args.iter().any(|a| a == "--semantic");
+    let hybrid = args.iter().any(|a| a == "--hybrid");
+    let mode = match (lexical, semantic, hybrid) {
+        (true, false, false) => recall::search::SearchMode::Lexical,
+        (false, true, false) => recall::search::SearchMode::Semantic,
+        (false, false, _) => recall::search::SearchMode::Hybrid,
+        _ => {
+            return Err(RecallError::usage(
+                "search mode flags --lexical / --semantic / --hybrid are mutually exclusive",
+            )
+            .into());
+        }
+    };
+
+    let palace = Palace::open_from_cwd()?;
+    let hits = recall::search::search(&palace, query, mode, room, limit)?;
+
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&hits)?);
+        return Ok(());
+    }
+
+    if hits.is_empty() {
+        println!("*(no matches)*");
+        return Ok(());
+    }
+
+    for (i, hit) in hits.iter().enumerate() {
+        let sim_str = hit
+            .similarity
+            .map(|s| format!(" sim={:.3}", s))
+            .unwrap_or_default();
+        let sem = hit
+            .rank_semantic
+            .map(|r| format!(" sem#{}", r + 1))
+            .unwrap_or_default();
+        let lex = hit
+            .rank_lexical
+            .map(|r| format!(" lex#{}", r + 1))
+            .unwrap_or_default();
+        println!(
+            "[{}] [{}] i={} score={:.4}{}{}{}",
+            i + 1,
+            hit.drawer.room,
+            hit.drawer.importance,
+            hit.score,
+            sim_str,
+            sem,
+            lex,
+        );
+        let snippet: String = hit
+            .drawer
+            .text
+            .chars()
+            .take(300)
+            .collect::<String>()
+            .replace('\n', " ");
+        println!("    id={}  {}", hit.drawer.id, snippet);
+        if let Some(f) = &hit.drawer.source_file {
+            println!("    src: {}", f);
+        } else if let Some(s) = &hit.drawer.source_session_id {
+            println!("    session: {}", &s[..s.len().min(8)]);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_recall_reembed(args: &[String]) -> Result<()> {
+    let palace = Palace::open_from_cwd()?;
+    let force = args.iter().any(|a| a == "--force");
+    let count = palace.reembed_all(force)?;
+    eprintln!("reembedded {} drawers", count);
+    Ok(())
 }
 
 fn format_unix(ts: i64) -> String {

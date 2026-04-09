@@ -866,3 +866,34 @@ description, rationale.)*
   R-422/R-423 for their slice of the surface (list ordering, JSON
   output, room filter), which is a spec conformance win rather than
   a deviation — moving the requirement text up a phase.
+
+- **2026-04-09** — Phase 3 delivered. Conformance check against
+  R-130..R-142, R-411..R-414, R-500..R-536 completed. fastembed
+  all-MiniLM-L6-v2 integrated (lazy lock on Palace, model cached at
+  `~/.ndx/models/`), L3 hybrid search with pinned K_SEM=50, K_LEX=50,
+  RRF_K=60 ships, L1 wake-up emits L0+L1, L2 `get` command wired,
+  `ndx recall reembed` backfills missing embeddings, 28 unit tests
+  green. Smoke test on this repo's `docs/` directory mined 145
+  drawers with full embedding + trigram population, verified
+  hybrid-beats-lexical on a synonym query ("synchronize memories
+  across agents" — semantic found the subsystem overview, lexical
+  only matched incidental keyword hits).
+
+- **2026-04-09 / Phase 3 / R-411** — The `ndx recall wake --force`
+  flag is accepted but is a no-op in Phase 3. `wake` always
+  regenerates L0+L1 output fresh, so `--force` is redundant until
+  Phase 5 ships hook wake-up session gating via the `wake_injected`
+  table (R-802). At that point `--force` will clear the current
+  session's marker before emitting, per R-805.
+
+- **2026-04-09 / Phase 3 / R-502** — The diagnostic warning for
+  identities rendered to more than ~1500 tokens is not yet emitted.
+  Low-value polish; will ship when a user hits the limit. No path
+  currently triggers it on any real identity file.
+
+- **2026-04-09 / Phase 3 / Insert path change** — `insert_drawer` now
+  synchronously embeds the drawer via the lazy embedder. Tests that
+  do not need an embedding (and cannot download the model offline)
+  use `insert_drawer_no_embedding`, exposed as a pub fn for the test
+  harness and for the `reembed` backfill path. No behavioural
+  divergence from the spec; this is an internal API split.

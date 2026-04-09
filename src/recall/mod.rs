@@ -11,18 +11,23 @@
 //! `drawer_embeddings`, cross-ref tables), so later phases do not require
 //! schema migration.
 
+pub mod embed;
 pub mod error;
 pub mod identity;
 pub mod mine;
+pub mod search;
 
 use anyhow::{Context, Result};
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+use embed::{Embedder, EMBEDDING_DIM, MODEL_ID};
 
 pub use error::{ExitCode, RecallError};
 
@@ -170,6 +175,7 @@ pub struct Palace {
     db: Database,
     project_root: PathBuf,
     next_drawer_id: AtomicU64,
+    embedder: OnceLock<Embedder>,
 }
 
 impl Palace {
@@ -299,12 +305,40 @@ impl Palace {
             db,
             project_root,
             next_drawer_id: AtomicU64::new(next_id),
+            embedder: OnceLock::new(),
         };
 
         if init {
             palace.ensure_room(UNCLASSIFIED_ROOM, None, None)?;
         }
         Ok(palace)
+    }
+
+    /// Global model cache directory: `~/.ndx/models/`.
+    pub fn model_cache_dir() -> Result<PathBuf> {
+        let home = dirs::home_dir().context("cannot determine home directory")?;
+        Ok(home.join(".ndx").join("models"))
+    }
+
+    /// Lazily load the embedder (downloads the model on first call) and
+    /// return a reference valid for the lifetime of the palace.
+    pub fn embedder(&self) -> Result<&Embedder> {
+        if let Some(e) = self.embedder.get() {
+            return Ok(e);
+        }
+        let cache = Self::model_cache_dir()?;
+        let e = Embedder::load(cache)?;
+        // record the model id in META on first load
+        {
+            let txn = self.db.begin_write()?;
+            {
+                let mut meta = txn.open_table(META)?;
+                meta.insert("embedding_model", MODEL_ID.as_bytes())?;
+            }
+            txn.commit()?;
+        }
+        let _ = self.embedder.set(e);
+        Ok(self.embedder.get().expect("embedder just set"))
     }
 
     pub fn project_root(&self) -> &Path {
@@ -497,58 +531,90 @@ impl Palace {
 
     // ── Drawers (Phase 1 primitives only; CLI plumbing in Phase 2/6) ──
 
-    /// Insert a drawer with content-hash dedup (R-102). Returns the stored
-    /// id and whether this was a dedup hit (existing drawer's importance
-    /// was bumped by 1, capped at 10) or a fresh insert.
+    /// Insert a drawer with content-hash dedup (R-102). Computes the
+    /// embedding synchronously via the lazy embedder. Returns the stored
+    /// id and whether this was a dedup hit.
     pub fn insert_drawer(&self, input: Drawer) -> Result<DrawerInsertOutcome> {
+        let embedding = self.embedder()?.embed_one(&input.text)?;
         let txn = self.db.begin_write()?;
-        let outcome = self.insert_drawer_in_txn(&txn, input)?;
+        let outcome = self.insert_drawer_in_txn(&txn, input, Some(embedding))?;
         txn.commit()?;
         Ok(outcome)
     }
 
-    /// Insert many drawers, batching into transactions of at most
-    /// [`MINE_BATCH_SIZE`] per commit (R-631). Partial failures leave
+    /// Insert a drawer WITHOUT computing an embedding. For tests and for
+    /// the Phase 3 reembed backfill path.
+    #[allow(dead_code)]
+    pub fn insert_drawer_no_embedding(
+        &self,
+        input: Drawer,
+    ) -> Result<DrawerInsertOutcome> {
+        let txn = self.db.begin_write()?;
+        let outcome = self.insert_drawer_in_txn(&txn, input, None)?;
+        txn.commit()?;
+        Ok(outcome)
+    }
+
+    /// Insert many drawers, embedding them in groups of
+    /// [`embed::EMBED_BATCH_SIZE`] outside the write transaction, then
+    /// committing each batch of at most [`MINE_BATCH_SIZE`] drawers
+    /// inside a single write transaction (R-631). Partial failures leave
     /// already-committed batches persisted (R-632).
     pub fn insert_drawers_batch<I: IntoIterator<Item = Drawer>>(
         &self,
         drawers: I,
     ) -> Result<Vec<DrawerInsertOutcome>> {
-        let mut outcomes = Vec::new();
-        let mut buf: Vec<Drawer> = Vec::with_capacity(MINE_BATCH_SIZE);
-        for d in drawers {
-            buf.push(d);
-            if buf.len() >= MINE_BATCH_SIZE {
-                self.commit_drawer_batch(std::mem::take(&mut buf), &mut outcomes)?;
-            }
+        let drawers: Vec<Drawer> = drawers.into_iter().collect();
+        if drawers.is_empty() {
+            return Ok(Vec::new());
         }
-        if !buf.is_empty() {
-            self.commit_drawer_batch(buf, &mut outcomes)?;
+        // Compute embeddings in groups, then commit in MINE_BATCH_SIZE
+        // transactional chunks. We keep the embedding loop outside the
+        // write txn so long embedder latency does not hold the db lock.
+        let embedder = self.embedder()?;
+        let texts: Vec<String> = drawers.iter().map(|d| d.text.clone()).collect();
+
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(embed::EMBED_BATCH_SIZE) {
+            let out = embedder.embed(chunk.to_vec())?;
+            embeddings.extend(out);
+        }
+        assert_eq!(embeddings.len(), drawers.len());
+
+        let mut outcomes = Vec::with_capacity(drawers.len());
+        let items: Vec<(Drawer, Vec<f32>)> = drawers.into_iter().zip(embeddings).collect();
+        for chunk in items.chunks(MINE_BATCH_SIZE) {
+            let txn = self.db.begin_write()?;
+            for (drawer, emb) in chunk {
+                let outcome =
+                    self.insert_drawer_in_txn(&txn, drawer.clone(), Some(emb.clone()))?;
+                outcomes.push(outcome);
+            }
+            txn.commit()?;
         }
         Ok(outcomes)
     }
 
-    fn commit_drawer_batch(
-        &self,
-        batch: Vec<Drawer>,
-        outcomes: &mut Vec<DrawerInsertOutcome>,
-    ) -> Result<()> {
-        let txn = self.db.begin_write()?;
-        for d in batch {
-            let outcome = self.insert_drawer_in_txn(&txn, d)?;
-            outcomes.push(outcome);
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
     /// Body of a drawer insert, scoped to an already-open write transaction.
-    /// The caller is responsible for commit.
+    /// The caller is responsible for commit. When `embedding` is provided
+    /// it must be 384-dim; it is persisted to `DRAWER_EMBEDDINGS`. When
+    /// `None`, no embedding row is written and semantic search will skip
+    /// the drawer until `ndx recall reembed` backfills it.
     fn insert_drawer_in_txn(
         &self,
         txn: &redb::WriteTransaction,
         mut input: Drawer,
+        embedding: Option<Vec<f32>>,
     ) -> Result<DrawerInsertOutcome> {
+        if let Some(ref e) = embedding {
+            if e.len() != EMBEDDING_DIM {
+                anyhow::bail!(
+                    "embedding dimension mismatch: expected {}, got {}",
+                    EMBEDDING_DIM,
+                    e.len()
+                );
+            }
+        }
         if input.text.len() > MAX_DRAWER_TEXT_BYTES {
             input
                 .text
@@ -647,6 +713,33 @@ impl Palace {
                 }
                 if let Some(fp) = input.source_file.as_deref() {
                     add_to_string_index(txn, FILE_DRAWER_XREF, fp, id)?;
+                }
+
+                // Embedding row (R-131, R-133).
+                if let Some(emb) = embedding {
+                    let bytes = embed::encode_embedding(&emb);
+                    let mut tbl = txn.open_table(DRAWER_EMBEDDINGS)?;
+                    tbl.insert(id, bytes.as_slice())?;
+                }
+
+                // Trigram posting-list updates (R-141..R-143).
+                let trigrams = extract_drawer_trigrams(&input.text);
+                if !trigrams.is_empty() {
+                    let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
+                    for tri in trigrams {
+                        let key = tri.as_slice();
+                        let existing: Vec<u8> = {
+                            let fetched = tri_tbl.get(key)?.map(|v| v.value().to_vec());
+                            fetched.unwrap_or_default()
+                        };
+                        let mut ids = decode_u64_list(&existing);
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                            ids.sort_unstable();
+                        }
+                        let new_bytes = encode_u64_list(&ids);
+                        tri_tbl.insert(key, new_bytes.as_slice())?;
+                    }
                 }
 
                 // Persist next_drawer_id counter.
@@ -769,6 +862,149 @@ impl Palace {
             created_at,
         })
     }
+
+    // ── Search-support readers (used by search.rs and the reembed path) ──
+
+    /// Iterate every (drawer_id, embedding) pair. Drawers without an
+    /// embedding row are omitted.
+    pub fn iter_embeddings(&self) -> Result<Vec<(u64, Vec<f32>)>> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(DRAWER_EMBEDDINGS)?;
+        let mut out = Vec::new();
+        for entry in tbl.iter()? {
+            let (k, v) = entry?;
+            out.push((k.value(), embed::decode_embedding(v.value())));
+        }
+        Ok(out)
+    }
+
+    /// Look up the drawer ids carrying a given trigram.
+    pub fn trigram_postings(&self, tri: &[u8; 3]) -> Result<Vec<u64>> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(DRAWER_TRIGRAMS)?;
+        let ids: Vec<u8>;
+        {
+            let fetched = tbl.get(tri.as_slice())?.map(|v| v.value().to_vec());
+            ids = fetched.unwrap_or_default();
+        }
+        Ok(decode_u64_list(&ids))
+    }
+
+    /// Look up the set of drawer ids in a given room (Phase 1 helper, now
+    /// also used for the search `--room` pre-filter).
+    pub fn drawer_ids_in_room_public(&self, room: &str) -> Result<Vec<u64>> {
+        self.drawer_ids_in_room(room)
+    }
+
+    /// Enumerate every drawer id currently stored (slow: full scan).
+    pub fn iter_all_drawer_ids(&self) -> Result<Vec<u64>> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(DRAWERS)?;
+        let mut out = Vec::new();
+        for entry in tbl.iter()? {
+            let (k, _) = entry?;
+            out.push(k.value());
+        }
+        Ok(out)
+    }
+
+    /// Create (or update) a link between two drawers. Idempotent: a
+    /// repeat call with the same `(from, to, kind)` is a no-op.
+    pub fn link_drawers(&self, from: u64, to: u64, kind: LinkKind) -> Result<()> {
+        let mut key = [0u8; 17];
+        key[..8].copy_from_slice(&from.to_le_bytes());
+        key[8..16].copy_from_slice(&to.to_le_bytes());
+        key[16] = kind as u8;
+        let txn = self.db.begin_write()?;
+        {
+            let mut tbl = txn.open_table(LINKS)?;
+            tbl.insert(key.as_slice(), &[] as &[u8])?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Return true iff at least one drawer has a Supersedes link pointing
+    /// at it (R-123 — such drawers are excluded from L1 wake-up).
+    pub fn is_superseded(&self, id: u64) -> Result<bool> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(LINKS)?;
+        // Scan all link keys for ones ending in (to=id, kind=Supersedes).
+        for entry in tbl.iter()? {
+            let (k, _) = entry?;
+            let key = k.value();
+            if key.len() != 17 {
+                continue;
+            }
+            let to = u64::from_le_bytes([
+                key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15],
+            ]);
+            let kind = key[16];
+            if to == id && kind == LinkKind::Supersedes as u8 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Reembed all drawers currently missing an embedding row (or all of
+    /// them if `force` is true). Used by `ndx recall reembed` and during
+    /// development when swapping models.
+    pub fn reembed_all(&self, force: bool) -> Result<u64> {
+        let embedder = self.embedder()?;
+
+        // Collect ids needing work.
+        let ids_to_reembed: Vec<u64> = {
+            let rtxn = self.db.begin_read()?;
+            let drawers = rtxn.open_table(DRAWERS)?;
+            let embeddings = rtxn.open_table(DRAWER_EMBEDDINGS)?;
+            let mut ids = Vec::new();
+            for entry in drawers.iter()? {
+                let (k, _) = entry?;
+                let id = k.value();
+                if force || embeddings.get(id)?.is_none() {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+
+        if ids_to_reembed.is_empty() {
+            return Ok(0);
+        }
+
+        // Load the drawer texts for those ids.
+        let texts: Vec<(u64, String)> = {
+            let rtxn = self.db.begin_read()?;
+            let drawers = rtxn.open_table(DRAWERS)?;
+            let mut out = Vec::with_capacity(ids_to_reembed.len());
+            for id in &ids_to_reembed {
+                if let Some(v) = drawers.get(*id)? {
+                    let d: Drawer = serde_json::from_slice(v.value())?;
+                    out.push((*id, d.text));
+                }
+            }
+            out
+        };
+
+        let mut count = 0u64;
+        for chunk in texts.chunks(embed::EMBED_BATCH_SIZE) {
+            let ids_chunk: Vec<u64> = chunk.iter().map(|(id, _)| *id).collect();
+            let text_chunk: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
+            let vecs = embedder.embed(text_chunk)?;
+
+            let txn = self.db.begin_write()?;
+            {
+                let mut tbl = txn.open_table(DRAWER_EMBEDDINGS)?;
+                for (id, v) in ids_chunk.iter().zip(vecs.iter()) {
+                    tbl.insert(*id, embed::encode_embedding(v).as_slice())?;
+                }
+            }
+            txn.commit()?;
+            count += chunk.len() as u64;
+        }
+        Ok(count)
+    }
 }
 
 // ── Helpers ──
@@ -839,6 +1075,27 @@ fn add_to_string_index(
     let bytes = encode_u64_list(&ids);
     t.insert(key, bytes.as_slice())?;
     Ok(())
+}
+
+/// Extract the set of 3-byte shingles present in a drawer's text.
+/// Bytes adjacent to NULs are skipped (treat text containing NUL as
+/// non-indexable). This is deliberately simpler than the line-aware
+/// `trigram::extract_trigrams_with_lines` used by the file index: drawer
+/// search doesn't need per-line granularity.
+pub fn extract_drawer_trigrams(text: &str) -> HashSet<[u8; 3]> {
+    let bytes = text.as_bytes();
+    let mut out: HashSet<[u8; 3]> = HashSet::new();
+    for window in bytes.windows(3) {
+        if !window.contains(&0) {
+            out.insert([window[0], window[1], window[2]]);
+        }
+    }
+    out
+}
+
+/// Extract unique query trigrams for L3 lexical lookup.
+pub fn extract_query_trigrams(query: &str) -> HashSet<[u8; 3]> {
+    extract_drawer_trigrams(query)
 }
 
 pub fn validate_room_name(name: &str) -> Result<()> {
@@ -932,7 +1189,7 @@ mod tests {
             updated_at: 0,
             metadata: BTreeMap::new(),
         };
-        p.insert_drawer(drawer).unwrap();
+        p.insert_drawer_no_embedding(drawer).unwrap();
         let err = p.delete_room("decisions").unwrap_err();
         let re = err.downcast_ref::<RecallError>().unwrap();
         assert_eq!(re.code, ExitCode::Constraint);
@@ -958,8 +1215,8 @@ mod tests {
             updated_at: 0,
             metadata: BTreeMap::new(),
         };
-        let o1 = p.insert_drawer(mk()).unwrap();
-        let o2 = p.insert_drawer(mk()).unwrap();
+        let o1 = p.insert_drawer_no_embedding(mk()).unwrap();
+        let o2 = p.insert_drawer_no_embedding(mk()).unwrap();
         assert_eq!(o1.id, o2.id, "dedup should return same id");
         assert!(!o1.deduped);
         assert!(o2.deduped);
@@ -988,9 +1245,9 @@ mod tests {
             updated_at: 0,
             metadata: BTreeMap::new(),
         };
-        let o1 = p.insert_drawer(d.clone()).unwrap();
+        let o1 = p.insert_drawer_no_embedding(d.clone()).unwrap();
         d.text = "world".into();
-        let o2 = p.insert_drawer(d).unwrap();
+        let o2 = p.insert_drawer_no_embedding(d).unwrap();
         assert_ne!(o1.id, o2.id);
         let moved = p.rename_room("foo", "bar").unwrap();
         assert_eq!(moved, 2);
