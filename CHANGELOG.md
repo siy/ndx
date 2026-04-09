@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.2 — /ndx-recall-handover skill
+
+- Added `/ndx-recall-handover` — session knowledge handover skill that prompts Claude to reflect on what it learned and save durable insights as memories for the next session
+- 7 skill files now ship with `ndx install` / `ndx init`
+
 ## v0.5.1 — QoL: auto-gitignore .ndx/
 
 - `ndx init` and `ndx recall init` now automatically add `.ndx/` to the project's `.gitignore` (creates the file if absent, idempotent on re-run)

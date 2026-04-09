@@ -127,8 +127,9 @@ The palace ingests everything raw. Quality (room assignment, importance, dedupli
 - `/ndx-recall-dedupe` — merge near-duplicates
 - `/ndx-recall-contradict` — flag contradictions between drawers
 - `/ndx-recall-summarize` — produce per-room summary drawers
+- `/ndx-recall-handover` — save session insights as memories for the next Claude session
 
-Run these periodically after large mines.
+Run classify/score/dedupe after large mines. Run handover at the end of any significant session.
 
 ## Cross-Reference Commands
 
@@ -331,6 +332,55 @@ Find and record contradictions between drawers so L1 wake-up can favor the curre
 - Always report unresolved contradictions to the user at the end of the run.
 "#;
 
+const SKILL_RECALL_HANDOVER: &str = r#"# /ndx-recall-handover — Session knowledge handover
+
+Reflect on what you learned during this session and save actionable observations as memories so the next Claude session starts smarter.
+
+## What to do
+
+1. **Review what happened this session**
+   Look at the work you did — code changes, decisions made, problems solved, user corrections, things that surprised you.
+
+2. **Identify durable insights**
+   Focus on knowledge that will still matter next session:
+   - **Mining strategy** — what to mine, what to skip, which paths have signal vs noise
+   - **Room taxonomy** — which rooms worked, which were too broad or too narrow, naming conventions
+   - **Scoring calibration** — what importance levels felt right for this project's content
+   - **User preferences** — corrections the user made, patterns they prefer, things they rejected
+   - **Project-specific patterns** — architectural decisions, key people, recurring themes, terminology
+
+3. **Save as memories**
+   Write each insight as a memory file. Use the appropriate type:
+   - `feedback` — for corrections and validated approaches ("user prefers X", "don't do Y because Z")
+   - `project` — for project-specific facts ("auth system uses JWT", "Alice owns deploys")
+   - `user` — for user preferences and working style
+
+4. **Check the recall palace state**
+   ```bash
+   ndx recall status
+   ndx recall room list
+   ```
+   Note anything about the palace's current state that would help the next session orient quickly.
+
+5. **Summarize for the user**
+   Report what you saved and why — transparency builds trust in the memory system.
+
+## What NOT to save
+
+- Code patterns visible in the codebase (just read the code)
+- Git history (use `git log`)
+- Anything already in CLAUDE.md
+- Ephemeral task state ("currently working on X")
+- Obvious facts that any session would discover independently
+
+## Guidelines
+
+- **Be concrete.** "Mining the full book/ directory creates 12K noise fragments" is useful. "Be careful with mining" is not.
+- **Include the why.** "Session memory is 80% noise — assistant narration like 'Let me read that file' isn't durable knowledge" is better than "filter session memory."
+- **Keep it short.** Each memory should be 3-8 lines. If it needs more, it's probably two memories.
+- **Check existing memories first.** Read what's already saved and update rather than duplicate.
+"#;
+
 const SKILL_RECALL_SUMMARIZE: &str = r#"# /ndx-recall-summarize — Generate per-room summary drawers
 
 Produce one high-quality summary drawer per active room. Summary drawers are stored in a `_summary_` room with max importance (10) so they surface first in L1 wake-up text.
@@ -453,6 +503,7 @@ pub const SKILL_FILES: &[(&str, &str)] = &[
     ("ndx-recall-dedupe.md", SKILL_RECALL_DEDUPE),
     ("ndx-recall-contradict.md", SKILL_RECALL_CONTRADICT),
     ("ndx-recall-summarize.md", SKILL_RECALL_SUMMARIZE),
+    ("ndx-recall-handover.md", SKILL_RECALL_HANDOVER),
 ];
 
 fn install_skill(skill_dir: &Path) -> Result<()> {
