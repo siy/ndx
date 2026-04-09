@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.1 — Fix UTF-8 boundary panics
+
+- Fixed 7 potential panics when truncating or slicing strings at non-ASCII character boundaries
+- Added `safe_truncate` and `safe_prefix` helpers (zero-cost for ASCII input)
+- Affects: drawer text truncation at 8KiB limit, session-id display, command event logging
+
 ## v0.6.0 — Auto-discovery, prebuilt binaries, CLAUDE.md integration
 
 ### Added
