@@ -55,9 +55,12 @@ fn print_usage() {
     eprintln!("  --limit N                    Limit results (all memory commands)");
     eprintln!();
     eprintln!("Cross-reference commands:");
-    eprintln!("  ndx xref file <path>     Find sessions that touched a file");
-    eprintln!("  ndx xref session <id>    List files touched by a session");
-    eprintln!("  --limit N                Limit results");
+    eprintln!("  ndx xref file <path>          Find sessions that touched a file");
+    eprintln!("  ndx xref session <id>         List files touched by a session");
+    eprintln!("  ndx xref drawer <file>        Find drawers that reference a file");
+    eprintln!("  ndx xref drawer-session <id>  Find drawers derived from a session");
+    eprintln!("  ndx xref git <commit>         Find drawers referencing files changed in a commit");
+    eprintln!("  --limit N                     Limit results");
     eprintln!();
     eprintln!("Daemon commands:");
     eprintln!("  ndx stop                 Stop the background daemon");
@@ -268,11 +271,19 @@ fn cmd_memory(args: &[String]) -> Result<()> {
 
 fn cmd_xref(args: &[String]) -> Result<()> {
     let sub = args.first().map(|s| s.as_str());
-    let sub_args = if args.len() > 1 { &args[1..] } else { &[] };
+    let sub_args: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
     let limit = get_flag_usize(args, "--limit");
 
-    let mem = MemoryIndex::open().context("failed to open memory database")?;
+    // Palace-backed xrefs are Phase 4 additions.
+    match sub {
+        Some("drawer") => return cmd_xref_drawer(sub_args),
+        Some("drawer-session") => return cmd_xref_drawer_session(sub_args),
+        Some("git") => return cmd_xref_git(sub_args),
+        _ => {}
+    }
 
+    // Legacy session/file xrefs over the global memory index.
+    let mem = MemoryIndex::open().context("failed to open memory database")?;
     let result = match sub {
         Some("file") => {
             let path = get_positional(sub_args, &["--limit"])
@@ -293,6 +304,63 @@ fn cmd_xref(args: &[String]) -> Result<()> {
     match result {
         Ok(output) => println!("{}", output),
         Err(e) => anyhow::bail!("{}", e),
+    }
+    Ok(())
+}
+
+fn cmd_xref_drawer(args: &[String]) -> Result<()> {
+    let path = get_positional(args, &["--limit"])
+        .ok_or_else(|| RecallError::usage("usage: ndx xref drawer <file>"))?;
+    let palace = Palace::open_from_cwd()?;
+    let limit = get_flag_usize(args, "--limit").unwrap_or(20);
+    let mut hits = palace.drawers_for_file(path)?;
+    hits.truncate(limit);
+    render_drawer_hits(&hits, args.iter().any(|a| a == "--json"))
+}
+
+fn cmd_xref_drawer_session(args: &[String]) -> Result<()> {
+    let id = get_positional(args, &["--limit"])
+        .ok_or_else(|| RecallError::usage("usage: ndx xref drawer-session <session-id>"))?;
+    let palace = Palace::open_from_cwd()?;
+    let limit = get_flag_usize(args, "--limit").unwrap_or(50);
+    let mut hits = palace.drawers_for_session(id)?;
+    hits.truncate(limit);
+    render_drawer_hits(&hits, args.iter().any(|a| a == "--json"))
+}
+
+fn cmd_xref_git(args: &[String]) -> Result<()> {
+    let commit = get_positional(args, &["--limit"])
+        .ok_or_else(|| RecallError::usage("usage: ndx xref git <commit>"))?;
+    let palace = Palace::open_from_cwd()?;
+    let limit = get_flag_usize(args, "--limit").unwrap_or(50);
+    let mut hits = palace.drawers_for_commit(commit)?;
+    hits.truncate(limit);
+    render_drawer_hits(&hits, args.iter().any(|a| a == "--json"))
+}
+
+fn render_drawer_hits(hits: &[recall::Drawer], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(hits)?);
+        return Ok(());
+    }
+    if hits.is_empty() {
+        println!("(no drawers)");
+        return Ok(());
+    }
+    for d in hits {
+        let snippet: String = d
+            .text
+            .chars()
+            .take(200)
+            .collect::<String>()
+            .replace('\n', " ");
+        let src = match (&d.source_file, &d.source_session_id) {
+            (Some(f), _) => format!("  src: {}", f),
+            (None, Some(s)) => format!("  session: {}", &s[..s.len().min(8)]),
+            _ => String::new(),
+        };
+        println!("[{:>5}] [{}] i={}{}", d.id, d.room, d.importance, src);
+        println!("        {}", snippet);
     }
     Ok(())
 }

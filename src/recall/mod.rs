@@ -947,6 +947,198 @@ impl Palace {
         Ok(false)
     }
 
+    /// Resolve a file path to the drawers that reference it.
+    /// Combines two signals (R-901):
+    ///   1. `FILE_DRAWER_XREF[file_path]` — drawers whose `source_file`
+    ///      matches the given path (project-relative).
+    ///   2. Trigram-narrowed candidates whose text contains the file's
+    ///      basename as a literal substring.
+    ///
+    /// Results are deduped and ordered by importance desc, updated_at
+    /// desc (R-902).
+    pub fn drawers_for_file(&self, file_path: &str) -> Result<Vec<Drawer>> {
+        use std::collections::BTreeSet;
+        let mut candidates: BTreeSet<u64> = BTreeSet::new();
+
+        // Direct source_file match.
+        let direct: Vec<u8>;
+        {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(FILE_DRAWER_XREF)?;
+            let fetched = tbl.get(file_path)?.map(|v| v.value().to_vec());
+            direct = fetched.unwrap_or_default();
+        }
+        for id in decode_u64_list(&direct) {
+            candidates.insert(id);
+        }
+
+        // Trigram basename mention.
+        let basename = std::path::Path::new(file_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file_path.to_string());
+        if !basename.is_empty() {
+            let query_tris = extract_query_trigrams(&basename);
+            if !query_tris.is_empty() {
+                // Intersect: a candidate drawer must carry every query trigram.
+                let mut first = true;
+                let mut running: std::collections::HashSet<u64> =
+                    std::collections::HashSet::new();
+                for tri in &query_tris {
+                    let posting = self.trigram_postings(tri)?;
+                    let set: std::collections::HashSet<u64> =
+                        posting.into_iter().collect();
+                    if first {
+                        running = set;
+                        first = false;
+                    } else {
+                        running.retain(|id| set.contains(id));
+                        if running.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                // Confirm by substring.
+                let rtxn = self.db.begin_read()?;
+                let drawers_tbl = rtxn.open_table(DRAWERS)?;
+                for id in running {
+                    if let Some(v) = drawers_tbl.get(id)? {
+                        let d: Drawer = serde_json::from_slice(v.value())?;
+                        if d.text.contains(&basename) {
+                            candidates.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hydrate + sort.
+        let mut out = Vec::with_capacity(candidates.len());
+        {
+            let rtxn = self.db.begin_read()?;
+            let drawers_tbl = rtxn.open_table(DRAWERS)?;
+            for id in candidates {
+                if let Some(v) = drawers_tbl.get(id)? {
+                    out.push(serde_json::from_slice::<Drawer>(v.value())?);
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            b.importance
+                .cmp(&a.importance)
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        Ok(out)
+    }
+
+    /// Resolve a session id to the drawers derived from (or mentioning) it.
+    /// Backed by `SESSION_DRAWER_XREF` (R-911).
+    pub fn drawers_for_session(&self, session_id: &str) -> Result<Vec<Drawer>> {
+        let ids_bytes: Vec<u8>;
+        {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(SESSION_DRAWER_XREF)?;
+            let fetched = tbl.get(session_id)?.map(|v| v.value().to_vec());
+            ids_bytes = fetched.unwrap_or_default();
+        }
+        let ids = decode_u64_list(&ids_bytes);
+        let mut out = Vec::with_capacity(ids.len());
+        let rtxn = self.db.begin_read()?;
+        let drawers_tbl = rtxn.open_table(DRAWERS)?;
+        for id in ids {
+            if let Some(v) = drawers_tbl.get(id)? {
+                out.push(serde_json::from_slice::<Drawer>(v.value())?);
+            }
+        }
+        out.sort_by(|a, b| {
+            b.importance
+                .cmp(&a.importance)
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        Ok(out)
+    }
+
+    /// Walk `git diff-tree` for a commit, collect drawers matching any of
+    /// the changed files, dedupe, and cache the result in
+    /// `COMMIT_DRAWER_XREF[<commit>]` for O(1) repeat lookups (R-921..R-922).
+    pub fn drawers_for_commit(&self, commit: &str) -> Result<Vec<Drawer>> {
+        // Fast path: cached.
+        {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(COMMIT_DRAWER_XREF)?;
+            let cached: Option<Vec<u8>> = tbl.get(commit)?.map(|v| v.value().to_vec());
+            if let Some(bytes) = cached {
+                let ids = decode_u64_list(&bytes);
+                let drawers_tbl = rtxn.open_table(DRAWERS)?;
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(v) = drawers_tbl.get(id)? {
+                        out.push(serde_json::from_slice::<Drawer>(v.value())?);
+                    }
+                }
+                out.sort_by(|a, b| {
+                    b.importance
+                        .cmp(&a.importance)
+                        .then(b.updated_at.cmp(&a.updated_at))
+                });
+                return Ok(out);
+            }
+        }
+
+        // Ask git for the changed files in this commit, run from the
+        // project root so relative paths match source_file entries.
+        let output = std::process::Command::new("git")
+            .current_dir(self.project_root())
+            .args(["diff-tree", "--no-commit-id", "--name-only", "-r", commit])
+            .output()
+            .context("failed to invoke `git`")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git diff-tree failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut all_ids: std::collections::BTreeSet<u64> = Default::default();
+        for file in &files {
+            for d in self.drawers_for_file(file)? {
+                all_ids.insert(d.id);
+            }
+        }
+
+        // Cache the id set.
+        let ids_vec: Vec<u64> = all_ids.iter().copied().collect();
+        {
+            let txn = self.db.begin_write()?;
+            {
+                let mut tbl = txn.open_table(COMMIT_DRAWER_XREF)?;
+                tbl.insert(commit, encode_u64_list(&ids_vec).as_slice())?;
+            }
+            txn.commit()?;
+        }
+
+        // Hydrate + sort.
+        let mut out = Vec::with_capacity(ids_vec.len());
+        let rtxn = self.db.begin_read()?;
+        let drawers_tbl = rtxn.open_table(DRAWERS)?;
+        for id in ids_vec {
+            if let Some(v) = drawers_tbl.get(id)? {
+                out.push(serde_json::from_slice::<Drawer>(v.value())?);
+            }
+        }
+        out.sort_by(|a, b| {
+            b.importance
+                .cmp(&a.importance)
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        Ok(out)
+    }
+
     /// Reembed all drawers currently missing an embedding row (or all of
     /// them if `force` is true). Used by `ndx recall reembed` and during
     /// development when swapping models.
@@ -1255,6 +1447,85 @@ mod tests {
         assert_eq!(d1.room, "bar");
         assert!(p.get_room("foo").unwrap().is_none());
         assert!(p.get_room("bar").unwrap().is_some());
+    }
+
+    #[test]
+    fn drawers_for_file_dedupes_and_orders() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        // Two drawers whose source_file == "src/auth.rs".
+        let mut d = Drawer {
+            id: 0,
+            text: "line from auth module".into(),
+            content_hash: String::new(),
+            room: UNCLASSIFIED_ROOM.to_string(),
+            wing: None,
+            importance: 3,
+            source_kind: SourceKind::Project,
+            source_session_id: None,
+            source_file: Some("src/auth.rs".into()),
+            source_line: Some(1),
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        };
+        p.insert_drawer_no_embedding(d.clone()).unwrap();
+        d.text = "another line from auth module".into();
+        d.importance = 9;
+        p.insert_drawer_no_embedding(d.clone()).unwrap();
+        // A drawer mentioning the basename "auth.rs" from a session.
+        let d_text = Drawer {
+            id: 0,
+            text: "decided to refactor auth.rs heavily".into(),
+            content_hash: String::new(),
+            room: UNCLASSIFIED_ROOM.to_string(),
+            wing: None,
+            importance: 7,
+            source_kind: SourceKind::Memory,
+            source_session_id: Some("abc".into()),
+            source_file: None,
+            source_line: None,
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        };
+        p.insert_drawer_no_embedding(d_text).unwrap();
+
+        let hits = p.drawers_for_file("src/auth.rs").unwrap();
+        assert_eq!(hits.len(), 3);
+        // Ordered importance desc: 9, 7, 3 (note: dedup bumps importance).
+        assert_eq!(hits[0].importance, 9);
+        assert_eq!(hits[1].importance, 7);
+        assert_eq!(hits[2].importance, 3);
+    }
+
+    #[test]
+    fn drawers_for_session_uses_xref() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        let d = Drawer {
+            id: 0,
+            text: "USER: hi\n\nASSISTANT: hello".into(),
+            content_hash: String::new(),
+            room: UNCLASSIFIED_ROOM.to_string(),
+            wing: None,
+            importance: 5,
+            source_kind: SourceKind::Memory,
+            source_session_id: Some("sess-42".into()),
+            source_file: None,
+            source_line: None,
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        };
+        p.insert_drawer_no_embedding(d).unwrap();
+        let hits = p.drawers_for_session("sess-42").unwrap();
+        assert_eq!(hits.len(), 1);
+        let miss = p.drawers_for_session("sess-other").unwrap();
+        assert!(miss.is_empty());
     }
 
     #[test]

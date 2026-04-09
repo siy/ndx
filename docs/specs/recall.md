@@ -897,3 +897,26 @@ description, rationale.)*
   use `insert_drawer_no_embedding`, exposed as a pub fn for the test
   harness and for the `reembed` backfill path. No behavioural
   divergence from the spec; this is an internal API split.
+
+- **2026-04-09** — Phase 4 delivered. Conformance check against
+  R-150..R-153, R-461..R-463, R-900..R-923 completed. Three new
+  `ndx xref` subcommands ship: `drawer`, `drawer-session`, `git`.
+  Git cross-ref walks `git diff-tree` on demand and caches the id
+  set to `COMMIT_DRAWER_XREF` for O(1) repeat lookups. File
+  cross-ref combines direct `source_file` matches with trigram-narrowed
+  basename substring confirms (AND of query trigrams, not OR). 23
+  recall unit tests green; smoke tests on the ndx repo verified
+  round-trips across all three directions (file → drawers,
+  session → drawers, commit → files → drawers).
+
+- **2026-04-09 / Phase 4 / Observation (not a deviation)** — R-102
+  content-hash dedup causes drawers whose text is naturally
+  repetitive (markdown separators, code fence markers, blank
+  lines escaped through the paragraph splitter) to accumulate
+  importance up to the 10-cap on repeated mine runs. Observed on
+  this repo: drawer id=3 (text `---`) reached i=10 after a single
+  mine pass of `docs/specs/recall.md` because the separator
+  appears ~15 times in that file. This is spec-correct behavior
+  per R-102 but surfaces a data-quality concern that the Phase 6
+  `/ndx-recall-score` skill will mitigate by letting Claude
+  downgrade noise drawers. No code change needed in Phase 4.
