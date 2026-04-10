@@ -868,6 +868,8 @@ fn cmd_recall_mine(args: &[String]) -> Result<()> {
     let from_memory = args.iter().any(|a| a == "--from-memory");
     let from_chroma_idx = args.iter().position(|a| a == "--from-chroma");
     let from_project = args.iter().any(|a| a == "--project");
+    let embed = args.iter().any(|a| a == "--embed");
+    let force = args.iter().any(|a| a == "--force");
 
     let mode_count = [from_memory, from_chroma_idx.is_some(), from_project]
         .iter()
@@ -875,14 +877,14 @@ fn cmd_recall_mine(args: &[String]) -> Result<()> {
         .count();
     if mode_count != 1 {
         return Err(RecallError::usage(
-            "usage: ndx recall mine <--from-memory | --from-chroma <dir> | --project [--path DIR]>",
+            "usage: ndx recall mine <--from-memory | --from-chroma <dir> | --project [--path DIR]> [--embed] [--force]",
         )
         .into());
     }
 
     let report = if from_memory {
         let since = get_flag(args, "--since");
-        recall::mine::mine_from_memory(&palace, since)?
+        recall::mine::mine_from_memory(&palace, since, force, embed)?
     } else if let Some(idx) = from_chroma_idx {
         let chroma_dir = args
             .get(idx + 1)
@@ -891,16 +893,26 @@ fn cmd_recall_mine(args: &[String]) -> Result<()> {
                 RecallError::usage("usage: ndx recall mine --from-chroma <chroma-dir>")
             })?;
         let wing = get_flag(args, "--wing");
-        recall::mine::mine_from_chroma(&palace, std::path::Path::new(chroma_dir), wing)?
+        recall::mine::mine_from_chroma(
+            &palace,
+            std::path::Path::new(chroma_dir),
+            wing,
+            embed,
+        )?
     } else {
         let path = get_flag(args, "--path").map(std::path::PathBuf::from);
-        recall::mine::mine_project(&palace, path.as_deref())?
+        recall::mine::mine_project(&palace, path.as_deref(), embed)?
     };
 
     eprintln!(
         "mine: added {}, deduped {}, skipped {}",
         report.added, report.deduped, report.skipped
     );
+    if !embed && report.added > 0 {
+        eprintln!(
+            "  (embeddings skipped — run `ndx recall reembed` or `ndx recall search` to generate)"
+        );
+    }
     Ok(())
 }
 

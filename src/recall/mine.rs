@@ -7,12 +7,14 @@
 
 use crate::memory::MemoryIndex;
 use crate::recall::{
-    Drawer, DrawerInsertOutcome, Palace, SourceKind, DEFAULT_IMPORTANCE, UNCLASSIFIED_ROOM,
+    Drawer, DrawerInsertOutcome, Palace, SourceKind, DEFAULT_IMPORTANCE,
+    MINE_BATCH_SIZE, UNCLASSIFIED_ROOM,
 };
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Outcome counts for a mine run (R-454).
@@ -38,21 +40,40 @@ impl MineReport {
 /// Read sessions from global `~/.ndx/memory.redb`, filter by the palace's
 /// project path, walk each session's JSONL file turn-pair by turn-pair,
 /// and emit one drawer per pair (R-601..R-605).
-pub fn mine_from_memory(palace: &Palace, since: Option<&str>) -> Result<MineReport> {
+///
+/// Streams in chunks of [`MINE_BATCH_SIZE`] to bound memory. Skips
+/// sessions already mined (by session_id + source_modified) unless
+/// `force` is true. Embedding is skipped by default (`embed = false`)
+/// for speed; run `ndx recall reembed` or `search` to backfill.
+pub fn mine_from_memory(
+    palace: &Palace,
+    since: Option<&str>,
+    force: bool,
+    embed: bool,
+) -> Result<MineReport> {
     let mem = MemoryIndex::open().context("failed to open global memory database")?;
     let project_path = palace.project_root().to_string_lossy().into_owned();
     let sessions = mem.list_sessions(Some(&project_path), usize::MAX)?;
 
     let mut report = MineReport::default();
-    let mut staged: Vec<Drawer> = Vec::new();
+    let mut buf: Vec<Drawer> = Vec::with_capacity(MINE_BATCH_SIZE);
+    let mut sessions_processed = 0u64;
 
-    for session in sessions {
+    for session in &sessions {
         // Filter by --since (R-605).
         if let Some(min) = since {
             let started = session.started_at.as_deref().unwrap_or("");
             if started < min {
                 continue;
             }
+        }
+
+        // Skip sessions already mined unless --force.
+        if !force
+            && palace
+                .session_already_mined(&session.session_id, session.source_modified)?
+        {
+            continue;
         }
 
         let src = Path::new(&session.source_path);
@@ -70,7 +91,7 @@ pub fn mine_from_memory(palace: &Palace, since: Option<&str>) -> Result<MineRepo
         };
 
         for text in pairs {
-            staged.push(Drawer {
+            buf.push(Drawer {
                 id: 0,
                 text,
                 content_hash: String::new(),
@@ -86,15 +107,50 @@ pub fn mine_from_memory(palace: &Palace, since: Option<&str>) -> Result<MineRepo
                 updated_at: 0,
                 metadata: BTreeMap::new(),
             });
+
+            // Flush chunk when buffer is full.
+            if buf.len() >= MINE_BATCH_SIZE {
+                flush_batch(palace, &mut buf, &mut report, embed)?;
+            }
         }
+
+        palace.mark_session_mined(&session.session_id, session.source_modified)?;
+        sessions_processed += 1;
+        eprint!(
+            "\rmining: {} drawers from {} sessions...",
+            report.added + report.deduped,
+            sessions_processed
+        );
     }
 
-    let outcomes = palace.insert_drawers_batch(staged)?;
+    // Final flush.
+    if !buf.is_empty() {
+        flush_batch(palace, &mut buf, &mut report, embed)?;
+    }
+    if sessions_processed > 0 {
+        eprintln!(); // newline after progress
+    }
+
+    palace.mark_last_mined()?;
+    Ok(report)
+}
+
+fn flush_batch(
+    palace: &Palace,
+    buf: &mut Vec<Drawer>,
+    report: &mut MineReport,
+    embed: bool,
+) -> Result<()> {
+    let batch = std::mem::take(buf);
+    let outcomes = if embed {
+        palace.insert_drawers_batch(batch)?
+    } else {
+        palace.insert_drawers_batch_no_embed(batch)?
+    };
     for o in outcomes {
         report.record(o);
     }
-    palace.mark_last_mined()?;
-    Ok(report)
+    Ok(())
 }
 
 /// Parse a Claude session JSONL file into turn-pair strings.
@@ -252,6 +308,7 @@ pub fn mine_from_chroma(
     palace: &Palace,
     chroma_dir: &Path,
     wing_filter: Option<&str>,
+    embed: bool,
 ) -> Result<MineReport> {
     use rusqlite::{Connection, OpenFlags};
 
@@ -387,7 +444,11 @@ pub fn mine_from_chroma(
         });
     }
 
-    let outcomes = palace.insert_drawers_batch(staged)?;
+    let outcomes = if embed {
+        palace.insert_drawers_batch(staged)?
+    } else {
+        palace.insert_drawers_batch_no_embed(staged)?
+    };
     for o in outcomes {
         report.record(o);
     }
@@ -408,14 +469,19 @@ struct ChromaDoc {
 // ── mine --project ─────────────────────────────────────────────────────
 
 /// Walk the project tree, paragraph-chunk text files, and emit one drawer
-/// per paragraph (R-621..R-624).
-pub fn mine_project(palace: &Palace, scan_root: Option<&Path>) -> Result<MineReport> {
+/// per paragraph (R-621..R-624). Streams in chunks to bound memory.
+pub fn mine_project(
+    palace: &Palace,
+    scan_root: Option<&Path>,
+    embed: bool,
+) -> Result<MineReport> {
     let root: PathBuf = scan_root
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| palace.project_root().to_path_buf());
 
     let mut report = MineReport::default();
-    let mut staged: Vec<Drawer> = Vec::new();
+    let mut buf: Vec<Drawer> = Vec::with_capacity(MINE_BATCH_SIZE);
+    let mut files_processed = 0u64;
 
     let walker = WalkBuilder::new(&root).standard_filters(true).build();
 
@@ -460,7 +526,7 @@ pub fn mine_project(palace: &Palace, scan_root: Option<&Path>) -> Result<MineRep
 
         let auto_room = infer_room_from_path(&rel);
         for (text, line) in split_paragraphs(&content) {
-            staged.push(Drawer {
+            buf.push(Drawer {
                 id: 0,
                 text,
                 content_hash: String::new(),
@@ -476,13 +542,29 @@ pub fn mine_project(palace: &Palace, scan_root: Option<&Path>) -> Result<MineRep
                 updated_at: 0,
                 metadata: BTreeMap::new(),
             });
+
+            if buf.len() >= MINE_BATCH_SIZE {
+                flush_batch(palace, &mut buf, &mut report, embed)?;
+            }
+        }
+
+        files_processed += 1;
+        if files_processed % 100 == 0 {
+            eprint!(
+                "\rmining: {} drawers from {} files...",
+                report.added + report.deduped,
+                files_processed
+            );
         }
     }
 
-    let outcomes = palace.insert_drawers_batch(staged)?;
-    for o in outcomes {
-        report.record(o);
+    if !buf.is_empty() {
+        flush_batch(palace, &mut buf, &mut report, embed)?;
     }
+    if files_processed >= 100 {
+        eprintln!();
+    }
+
     palace.mark_last_mined()?;
     Ok(report)
 }

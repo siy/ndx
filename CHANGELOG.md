@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.2 — Mining performance overhaul
+
+- **No-embed default** — mine commands skip embedding by default; 5-10x faster. Run `ndx recall reembed` to backfill when ready to search. Use `--embed` flag to embed during mine.
+- **Streaming pipeline** — mine processes drawers in chunks of 1000 instead of collecting all in memory. Prevents OOM on large projects.
+- **Session tracking** — `mine --from-memory` records which sessions were mined. Re-runs skip unchanged sessions (0.4s re-mine vs 3:42 first run on a 9K-drawer project). Use `--force` to re-process all.
+- **Signal filter** — `mine --from-memory` auto-filters assistant narration noise ("Let me read...", "Now I'll check...") and trivial user turns ("ok", "yes"). Keeps only decision/rationale/outcome content.
+- **Batch trigram aggregation** — trigram posting-list updates aggregated per transaction batch instead of per-drawer. ~41% wall-time improvement on large mines.
+- **Progress counter** — stderr shows `mining: N drawers from M sessions...` during long runs
+- **Source-aware auto-rooms** — `mine --project` maps CHANGELOG.md→releases, CLAUDE.md→conventions, docs/specs/→architecture, proposals/→proposals, etc.
+- **Benchmarked on 800K LoC project:** 9,121 drawers from 102 sessions in 3:42 (no embed), re-mine in 0.4s
+
 ## v0.6.1 — Fix UTF-8 boundary panics
 
 - Fixed 7 potential panics when truncating or slicing strings at non-ASCII character boundaries
