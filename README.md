@@ -308,6 +308,10 @@ ndx uses the same YAML manifest format as [kcp-commands](https://github.com/Cant
 
 - `RUST_LOG` — control log verbosity (e.g. `RUST_LOG=ndx=debug`). Daemon logs go to `.ndx/ndx.log`.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Acknowledgments
 
 ndx's episodic memory, command manifest, and recall palace features are inspired by and compatible with:
