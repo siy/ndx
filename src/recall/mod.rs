@@ -1527,6 +1527,48 @@ impl Palace {
         Ok(count)
     }
 
+    /// Update room (and optionally importance) for all drawers whose text
+    /// matches `pattern` (case-insensitive regex). Optionally restrict to
+    /// drawers currently in `from_room`. Returns matched drawer ids + count.
+    pub fn bulk_update_by_search(
+        &self,
+        pattern: &str,
+        new_room: &str,
+        new_importance: Option<u8>,
+        from_room: Option<&str>,
+        dry_run: bool,
+    ) -> Result<(Vec<Drawer>, u64)> {
+        validate_room_name(new_room)?;
+        if let Some(i) = new_importance {
+            if !(1..=10).contains(&i) {
+                return Err(RecallError::usage("importance must be in 1..=10").into());
+            }
+        }
+
+        let re = regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| RecallError::usage(format!("invalid regex `{}`: {}", pattern, e)))?;
+
+        let all = self.list_drawers(from_room, usize::MAX, 0)?;
+        let matched: Vec<Drawer> = all
+            .into_iter()
+            .filter(|d| re.is_match(&d.text))
+            .collect();
+
+        if dry_run || matched.is_empty() {
+            let count = matched.len() as u64;
+            return Ok((matched, count));
+        }
+
+        let mut count = 0u64;
+        for d in &matched {
+            self.update_drawer(d.id, Some(new_room), new_importance, None)?;
+            count += 1;
+        }
+        Ok((matched, count))
+    }
+
     // ── Wake-up injection state (Phase 5 / R-160 series) ──
 
     /// Return true if wake-up text has already been injected into the

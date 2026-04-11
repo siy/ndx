@@ -1018,11 +1018,61 @@ fn cmd_recall_drawer(args: &[String]) -> Result<()> {
         }
         Some("update") => {
             let source_file = get_flag(sub_args, "--source-file");
+            let search = get_flag(sub_args, "--search");
             let id = get_flag_usize(sub_args, "--id");
             let room = get_flag(sub_args, "--room");
             let importance =
                 get_flag_usize(sub_args, "--importance").map(|n| n as u8);
             let text = get_flag(sub_args, "--text");
+            let from_room = get_flag(sub_args, "--from-room");
+            let dry_run = sub_args.iter().any(|a| a == "--dry-run");
+
+            // Bulk mode: --search <pattern> + --room
+            if let Some(pattern) = search {
+                let target_room = room.ok_or_else(|| {
+                    RecallError::usage(
+                        "bulk search update needs --room: ndx recall drawer update --search <pattern> --room <room>",
+                    )
+                })?;
+                let palace = Palace::open_from_cwd()?;
+                let (matched, count) = palace.bulk_update_by_search(
+                    pattern,
+                    target_room,
+                    importance,
+                    from_room,
+                    dry_run,
+                )?;
+                if sub_args.iter().any(|a| a == "--json") {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ok": true,
+                            "updated": count,
+                            "search": pattern,
+                            "room": target_room,
+                            "dry_run": dry_run,
+                        })
+                    );
+                } else if dry_run {
+                    eprintln!(
+                        "dry-run: {} drawers would move to room \"{}\"",
+                        count, target_room
+                    );
+                    for d in matched.iter().take(5) {
+                        let snippet: String = d.text.chars().take(80).collect::<String>().replace('\n', " ");
+                        eprintln!("  [{}] \"{}\"", d.id, snippet);
+                    }
+                    if count > 5 {
+                        eprintln!("  ... ({} more)", count - 5);
+                    }
+                } else {
+                    eprintln!(
+                        "updated {} drawers -> room \"{}\" (matched \"{}\")",
+                        count, target_room, pattern
+                    );
+                }
+                return Ok(());
+            }
 
             // Bulk mode: --source-file + --room (no --id needed).
             if let Some(sf) = source_file {

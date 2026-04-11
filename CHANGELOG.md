@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.3 — Bulk search-based drawer update
+
+- `ndx recall drawer update --search <regex> --room <room>` — bulk-move drawers matching a case-insensitive regex pattern
+- `--from-room <room>` — restrict search to drawers currently in a specific room
+- `--dry-run` — preview matched drawers without modifying (shows first 5 with snippets)
+- `--importance N` — optionally set importance alongside the room move
+- Supports full regex syntax (`ring buffer|replication`, `R-10[0-9]`, etc.)
+
 ## v0.6.2 — Mining performance overhaul
 
 - **No-embed default** — mine commands skip embedding by default; 5-10x faster. Run `ndx recall reembed` to backfill when ready to search. Use `--embed` flag to embed during mine.
