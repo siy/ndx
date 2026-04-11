@@ -16,7 +16,7 @@ use recall::{ExitCode, Palace, RecallError};
 use std::path::PathBuf;
 
 fn print_usage() {
-    eprintln!("ndx — Fast File Index & Memory Search CLI");
+    eprintln!("ndx {} — Fast File Index & Memory Search CLI", env!("CARGO_PKG_VERSION"));
     eprintln!();
     eprintln!("File index commands (operate on project in current directory):");
     eprintln!("  ndx search <pattern>     Search file contents (trigram-accelerated)");
@@ -1473,6 +1473,10 @@ fn dispatch(args: &[String]) -> Result<()> {
             cmd_init(dir)
         }
 
+        Some("--version" | "-V" | "version") => {
+            println!("ndx {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("help" | "--help" | "-h") => {
             print_usage();
             Ok(())
