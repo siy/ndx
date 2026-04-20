@@ -1042,3 +1042,33 @@ description, rationale.)*
   what clear-all delivers. A narrower `--force --session <id>`
   form can be added later without a spec rewrite if clear-all
   proves too coarse.
+
+- **2026-04-20 / v0.7.0 / R-141..R-143, R-532** — Drawer-text
+  trigram index replaced by Okapi BM25 over a unicode-aware
+  tokenizer. Schema bumped from v1 to v2. Tables
+  `drawer_trigrams` / `drawers_by_trigram` are dropped; new
+  tables `bm25_postings` (token → packed `(drawer_id, tf)`
+  list), `drawers_by_token` (cascade index),
+  `drawer_lengths` (document length for BM25 normalisation),
+  and `bm25_meta` (`N`, `total_length`) take their place.
+  Tokenizer: split on any non-alphanumeric, lowercase, drop
+  tokens shorter than 2 chars, drop a 31-entry English
+  stopword list. No stemming. Parameters `k1 = 1.2,
+  b = 0.75` (both the scientific default and the baseline
+  cited in Anthropic's contextual retrieval report).
+  Rationale: trigrams are the right tool for code substring
+  search (daemon `trigram.rs` keeps them) but BM25 is the
+  industry baseline for natural-language lexical ranking;
+  it fuses better with the semantic channel under RRF on
+  synonym and rare-term queries than a trigram hit-count
+  did, and stops single-character shingles from dominating
+  the posting lists. No auto-migration: opening a v1 palace
+  returns schema-version error with a hint to run
+  `ndx recall rebuild-index`. A new `ndx recall
+  rebuild-index` command re-tokenises every drawer without
+  touching embeddings. Search mode `--lexical` and `--hybrid`
+  now score via BM25 instead of trigram hit-count; K_LEX=50
+  and RRF_K=60 are preserved. `drawers_for_file` basename
+  narrowing switched from trigram intersection to a
+  full-scan substring match — palace corpora are small
+  (<10³ drawers typical) and the code path is simpler.
