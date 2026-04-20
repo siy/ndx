@@ -93,7 +93,7 @@ ndx recall wake                            # L0 identity + L1 top drawers, as pr
 ndx recall get --room architecture         # L2 metadata retrieval
 ndx recall search "query"                  # L3 hybrid (default: semantic + lexical RRF)
 ndx recall search "query" --semantic       # semantic only
-ndx recall search "query" --lexical        # trigram only
+ndx recall search "query" --lexical        # BM25 only
 ndx recall search "query" --room decisions
 ```
 
@@ -148,6 +148,7 @@ ndx scan              # re-scan project index + memory database
 ndx install           # download command manifests, register hook + skill
 ndx init              # install ndx skills into current project
 ndx recall reembed    # backfill embeddings (downloads model if needed)
+ndx recall rebuild-index  # re-tokenize all drawers into BM25 (one-shot after 0.7.0 upgrade)
 ```
 "#;
 
@@ -279,7 +280,7 @@ Find drawers with overlapping content and merge them into a single canonical ent
    ndx recall drawer update --id A --text "merged content" --importance <bumped>
    ndx recall drawer rm --id B
    ```
-   When the survivor's text changes, its embedding and trigram index are regenerated automatically.
+   When the survivor's text changes, its embedding and BM25 index are regenerated automatically.
 
 4. **Record supersession** (optional, preserves audit trail instead of deleting)
    ```bash
