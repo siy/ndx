@@ -1066,7 +1066,12 @@ description, rationale.)*
   returns schema-version error with a hint to run
   `ndx recall rebuild-index`. A new `ndx recall
   rebuild-index` command re-tokenises every drawer without
-  touching embeddings. Search mode `--lexical` and `--hybrid`
+  touching embeddings. `rebuild-index` opens the palace via
+  a dedicated `Palace::open_for_migration` path that skips
+  the `stored < SCHEMA_VERSION` guard (but still rejects
+  newer-than-supported palaces), and the rebuild commits a
+  final write that stamps `schema_version = 2` so later
+  strict opens succeed. Search mode `--lexical` and `--hybrid`
   now score via BM25 instead of trigram hit-count; K_LEX=50
   and RRF_K=60 are preserved. `drawers_for_file` basename
   narrowing switched from trigram intersection to a
