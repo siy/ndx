@@ -1072,3 +1072,25 @@ description, rationale.)*
   narrowing switched from trigram intersection to a
   full-scan substring match — palace corpora are small
   (<10³ drawers typical) and the code path is simpler.
+
+- **2026-04-20 / v0.7.0 / PreCompact hook** — A second Claude
+  Code hook is registered by `ndx install`: `PreCompact` (no
+  matcher, fires for both `/compact` and automatic compaction).
+  Claude Code invokes `ndx hook` on stdin with
+  `hook_event_name == "PreCompact"` and fields `{session_id,
+  transcript_path, cwd, trigger ("manual"|"auto"),
+  custom_instructions}`. `cmd_hook` dispatches on
+  `hook_event_name`; the PreCompact branch emits a narrower
+  `hookSpecificOutput` (`hookEventName`, `additionalContext`
+  only — no `permissionDecision`, no `updatedInput`) carrying
+  the L0+L1 wake-up text, so the palace context survives
+  compaction. The PreCompact path intentionally **does not
+  consult or update** the `WAKE_INJECTED` per-session gate used
+  by PreToolUse (R-802): PreCompact is a separate channel whose
+  whole purpose is to re-inject every time compaction runs.
+  Soft-fail semantics match PreToolUse: missing cwd, missing
+  palace, embedder failure, or I/O error exits 0 with no output.
+  Settings registration is idempotent across re-installs and
+  binary-path changes. Not a spec divergence — the spec's R-800
+  series covers wake-up injection generically; PreCompact is an
+  additional delivery channel. No new requirement IDs allocated.
