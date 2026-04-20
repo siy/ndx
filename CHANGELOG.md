@@ -1,5 +1,7 @@
 # Changelog
 
+## v0.7.0 — Unreleased
+
 ## v0.6.3 — Bulk search-based drawer update
 
 - `ndx recall drawer update --search <regex> --room <room>` — bulk-move drawers matching a case-insensitive regex pattern
