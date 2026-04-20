@@ -595,6 +595,7 @@ fn cmd_recall(args: &[String]) -> Result<()> {
         Some("get") => cmd_recall_get(sub_args),
         Some("search") => cmd_recall_search(sub_args),
         Some("reembed") => cmd_recall_reembed(sub_args),
+        Some("rebuild-index") => cmd_recall_rebuild_index(sub_args),
         Some(other) => Err(RecallError::usage(format!(
             "unknown recall subcommand `{}`. Run `ndx help` for usage.",
             other
@@ -640,6 +641,7 @@ fn print_recall_usage() {
     eprintln!("  ndx recall get --room X [--limit N] [--json]");
     eprintln!("  ndx recall search \"query\" [--room X] [--limit N] [--lexical|--semantic|--hybrid] [--json]");
     eprintln!("  ndx recall reembed [--force]    Backfill embeddings (downloads model if needed)");
+    eprintln!("  ndx recall rebuild-index        Re-tokenize all drawers into the BM25 lexical index");
     eprintln!();
     eprintln!("Identity:");
     eprintln!("  ndx recall identity show [--merged]");
@@ -1372,6 +1374,13 @@ fn cmd_recall_reembed(args: &[String]) -> Result<()> {
     let force = args.iter().any(|a| a == "--force");
     let count = palace.reembed_all(force)?;
     eprintln!("reembedded {} drawers", count);
+    Ok(())
+}
+
+fn cmd_recall_rebuild_index(_args: &[String]) -> Result<()> {
+    let palace = Palace::open_from_cwd()?;
+    let count = palace.rebuild_bm25_index()?;
+    eprintln!("rebuilt BM25 index for {} drawers", count);
     Ok(())
 }
 

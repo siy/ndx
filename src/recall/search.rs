@@ -1,12 +1,10 @@
-//! L1 wake-up text generation + L3 hybrid (cosine + trigram + RRF) search.
+//! L1 wake-up text generation + L3 hybrid (cosine + BM25 + RRF) search.
 //!
 //! Implements spec §9.2 (R-511..R-515) and §9.4 (R-530..R-536).
 //! L0 rendering lives in `identity`; L2 metadata retrieval is handled by
 //! `Palace::list_drawers` (used directly from the CLI).
 
-use crate::recall::{
-    extract_query_trigrams, identity, project_name, Drawer, Palace,
-};
+use crate::recall::{bm25, identity, project_name, Drawer, Palace};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -71,28 +69,53 @@ pub fn search(
         }
     }
 
-    // ── Lexical channel ──
+    // ── Lexical channel (BM25 over a simple tokenizer) ──
     let mut lex_rank: HashMap<u64, usize> = HashMap::new();
     if matches!(mode, SearchMode::Hybrid | SearchMode::Lexical) {
-        let query_tris = extract_query_trigrams(query);
-        if !query_tris.is_empty() {
-            let mut hit_counts: HashMap<u64, u32> = HashMap::new();
-            for tri in &query_tris {
-                let ids = palace.trigram_postings(tri)?;
-                for id in ids {
-                    if let Some(set) = &room_filter {
-                        if !set.contains(&id) {
-                            continue;
-                        }
+        let query_tokens = bm25::tokenize(query);
+        let unique_tokens: HashSet<String> = query_tokens.into_iter().collect();
+        if !unique_tokens.is_empty() {
+            let (n_docs, _total, avg_dl) = palace.bm25_corpus_stats()?;
+            if n_docs > 0 {
+                // Accumulate BM25 score per candidate drawer.
+                let mut scores: HashMap<u64, f32> = HashMap::new();
+                // Cache document lengths so we pay the read once per candidate.
+                let mut doc_lengths: HashMap<u64, u32> = HashMap::new();
+                for tok in &unique_tokens {
+                    let postings = palace.bm25_postings(tok)?;
+                    if postings.is_empty() {
+                        continue;
                     }
-                    *hit_counts.entry(id).or_insert(0) += 1;
+                    let df = postings.len() as u64;
+                    let idf = bm25::idf(n_docs, df);
+                    for (id, tf) in postings {
+                        if let Some(set) = &room_filter {
+                            if !set.contains(&id) {
+                                continue;
+                            }
+                        }
+                        let dl = match doc_lengths.get(&id) {
+                            Some(v) => *v,
+                            None => {
+                                let v = palace.drawer_token_length(id)?;
+                                doc_lengths.insert(id, v);
+                                v
+                            }
+                        };
+                        let s = bm25::term_score(tf, dl, avg_dl, idf);
+                        *scores.entry(id).or_insert(0.0) += s;
+                    }
                 }
-            }
-            let mut scored: Vec<(u64, u32)> = hit_counts.into_iter().collect();
-            // Descending: most trigram matches first; tiebreak by lower id.
-            scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            for (rank, (id, _)) in scored.into_iter().take(K_LEX).enumerate() {
-                lex_rank.insert(id, rank);
+                let mut scored: Vec<(u64, f32)> = scores.into_iter().collect();
+                // Descending: highest BM25 score first; tiebreak by lower id.
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
+                });
+                for (rank, (id, _)) in scored.into_iter().take(K_LEX).enumerate() {
+                    lex_rank.insert(id, rank);
+                }
             }
         }
     }

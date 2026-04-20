@@ -6,11 +6,12 @@
 //! and hook integration live in Phase 2+ and will extend this module without
 //! changing the schema.
 //!
-//! The schema is created at version 1 (R-172). All tables are opened up
-//! front even when not yet populated (e.g. `drawer_trigrams`,
-//! `drawer_embeddings`, cross-ref tables), so later phases do not require
-//! schema migration.
+//! The schema is created at the current [`SCHEMA_VERSION`]. All tables
+//! are opened up front even when not yet populated (e.g. `bm25_postings`,
+//! `drawer_embeddings`, cross-ref tables), so steady-state operation
+//! does not require per-phase migration steps.
 
+pub mod bm25;
 pub mod embed;
 pub mod error;
 pub mod identity;
@@ -22,7 +23,7 @@ use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -33,7 +34,15 @@ pub use error::{ExitCode, RecallError};
 
 // ── Schema constants ──
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// Palace schema version.
+///
+/// v1 — initial layout (R-172).
+/// v2 — drawer-text trigram index replaced by BM25 over a tokenizer.
+///      Tables `drawer_trigrams` / `drawers_by_trigram` dropped; new
+///      tables `bm25_postings`, `drawers_by_token`, `drawer_lengths`,
+///      `bm25_meta`. No auto-migration; palaces predating v2 must be
+///      rebuilt via `ndx recall rebuild-index`.
+pub const SCHEMA_VERSION: u32 = 2;
 pub const UNCLASSIFIED_ROOM: &str = "unclassified";
 pub const DEFAULT_IMPORTANCE: u8 = 5;
 pub const MAX_DRAWER_TEXT_BYTES: usize = 8 * 1024;
@@ -55,9 +64,18 @@ const DRAWERS_BY_ROOM: TableDefinition<&str, &[u8]> =
     TableDefinition::new("drawers_by_room");
 /// room_name → serialized Room
 const ROOMS: TableDefinition<&str, &[u8]> = TableDefinition::new("rooms");
-/// trigram (3 bytes) → packed u64 drawer_ids (Phase 3)
-const DRAWER_TRIGRAMS: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("drawer_trigrams");
+/// token → packed (u64 drawer_id, u32 tf) posting list for BM25
+/// lexical search. Schema v2.
+const BM25_POSTINGS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("bm25_postings");
+/// drawer_id → packed token list (for cascade on delete). Schema v2.
+const DRAWERS_BY_TOKEN: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("drawers_by_token");
+/// drawer_id → u32 token count (document length for BM25). Schema v2.
+const DRAWER_LENGTHS: TableDefinition<u64, u32> =
+    TableDefinition::new("drawer_lengths");
+/// BM25 corpus stats: "N" → u64, "total_length" → u64. Schema v2.
+const BM25_META: TableDefinition<&str, &[u8]> = TableDefinition::new("bm25_meta");
 /// link key = from.to_le_bytes() ++ to.to_le_bytes() ++ [kind_tag] → ()
 const LINKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("links");
 /// project-relative file path → packed u64 drawer_ids (Phase 4)
@@ -270,9 +288,10 @@ impl Palace {
         let db = Database::create(&db_path)
             .with_context(|| format!("opening {}", db_path.display()))?;
 
-        // Open all tables in a single write txn so the schema is pinned at
-        // version 1 from the start. Tables not yet used in Phase 1 still
-        // exist so later phases do not require migrations.
+        // Open all tables in a single write txn so the schema is pinned
+        // from the start of the process. Tables not currently populated
+        // on a fresh palace still exist so steady-state writes do not
+        // need to create them lazily.
         {
             let txn = db.begin_write()?;
             txn.open_table(DRAWERS)?;
@@ -280,7 +299,10 @@ impl Palace {
             txn.open_table(DRAWER_EMBEDDINGS)?;
             txn.open_table(DRAWERS_BY_ROOM)?;
             txn.open_table(ROOMS)?;
-            txn.open_table(DRAWER_TRIGRAMS)?;
+            txn.open_table(BM25_POSTINGS)?;
+            txn.open_table(DRAWERS_BY_TOKEN)?;
+            txn.open_table(DRAWER_LENGTHS)?;
+            txn.open_table(BM25_META)?;
             txn.open_table(LINKS)?;
             txn.open_table(FILE_DRAWER_XREF)?;
             txn.open_table(SESSION_DRAWER_XREF)?;
@@ -302,6 +324,15 @@ impl Palace {
                     if stored > SCHEMA_VERSION {
                         return Err(RecallError::schema_version(format!(
                             "palace schema version {} exceeds supported maximum {}",
+                            stored, SCHEMA_VERSION
+                        ))
+                        .into());
+                    }
+                    if stored < SCHEMA_VERSION {
+                        return Err(RecallError::schema_version(format!(
+                            "palace schema version {} is older than supported {} \
+                             (lexical index changed from trigrams to BM25). \
+                             Run `ndx recall rebuild-index` to upgrade.",
                             stored, SCHEMA_VERSION
                         ))
                         .into());
@@ -594,9 +625,9 @@ impl Palace {
     }
 
     /// Insert many drawers WITHOUT embeddings, batching into transactions
-    /// of at most [`MINE_BATCH_SIZE`] per commit. Trigram updates are
-    /// aggregated per-batch and flushed once per unique trigram instead
-    /// of per-drawer, reducing I/O by ~300x for large batches.
+    /// of at most [`MINE_BATCH_SIZE`] per commit. BM25 posting updates are
+    /// aggregated per-batch and flushed once per unique token instead of
+    /// per-drawer, reducing I/O by ~300x for large batches.
     pub fn insert_drawers_batch_no_embed(
         &self,
         drawers: Vec<Drawer>,
@@ -605,45 +636,72 @@ impl Palace {
         for chunk in drawers.chunks(MINE_BATCH_SIZE) {
             let txn = self.db.begin_write()?;
             // Phase 1: insert rows, hash bindings, room + xref indexes.
-            // Collect (new_id, trigram_set) for batch trigram flush.
-            let mut trigram_batch: Vec<(u64, HashSet<[u8; 3]>)> = Vec::new();
+            // Collect (new_id, tokens) for batch BM25 flush.
+            let mut bm25_batch: Vec<(u64, Vec<String>)> = Vec::new();
             for d in chunk {
                 let outcome =
-                    self.insert_drawer_in_txn_skip_trigrams(&txn, d.clone(), None)?;
+                    self.insert_drawer_in_txn_skip_bm25(&txn, d.clone(), None)?;
                 if !outcome.deduped {
-                    let tris = extract_drawer_trigrams(&d.text);
-                    if !tris.is_empty() {
-                        trigram_batch.push((outcome.id, tris));
+                    let tokens = bm25::tokenize(&d.text);
+                    if !tokens.is_empty() {
+                        bm25_batch.push((outcome.id, tokens));
                     }
                 }
                 outcomes.push(outcome);
             }
-            // Phase 2: aggregate trigram → drawer_id map and flush.
-            if !trigram_batch.is_empty() {
-                let mut agg: std::collections::HashMap<[u8; 3], Vec<u64>> =
+            // Phase 2: flush BM25 state in one sweep.
+            if !bm25_batch.is_empty() {
+                // Per-drawer: write length and reverse index.
+                let mut total_len_delta: u64 = 0;
+                let mut doc_count_delta: u64 = 0;
+                {
+                    let mut lengths = txn.open_table(DRAWER_LENGTHS)?;
+                    let mut rev = txn.open_table(DRAWERS_BY_TOKEN)?;
+                    for (id, tokens) in &bm25_batch {
+                        lengths.insert(*id, tokens.len() as u32)?;
+                        rev.insert(*id, encode_token_list(tokens).as_slice())?;
+                        total_len_delta += tokens.len() as u64;
+                        doc_count_delta += 1;
+                    }
+                }
+                // Aggregate token → list of (id, tf) across the batch.
+                let mut agg: std::collections::HashMap<String, Vec<(u64, u32)>> =
                     Default::default();
-                for (id, tris) in trigram_batch {
-                    for tri in tris {
-                        agg.entry(tri).or_default().push(id);
+                for (id, tokens) in bm25_batch {
+                    let tf = bm25::term_frequencies(&tokens);
+                    for (tok, count) in tf {
+                        agg.entry(tok).or_default().push((id, count));
                     }
                 }
-                let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
-                for (tri, new_ids) in agg {
-                    let existing: Vec<u8>;
-                    {
-                        let fetched =
-                            tri_tbl.get(tri.as_slice())?.map(|v| v.value().to_vec());
-                        existing = fetched.unwrap_or_default();
-                    }
-                    let mut ids = decode_u64_list(&existing);
-                    for nid in new_ids {
-                        if !ids.contains(&nid) {
-                            ids.push(nid);
-                        }
-                    }
-                    ids.sort_unstable();
-                    tri_tbl.insert(tri.as_slice(), encode_u64_list(&ids).as_slice())?;
+                let mut posts = txn.open_table(BM25_POSTINGS)?;
+                for (tok, new_entries) in agg {
+                    let existing: Vec<u8> = posts
+                        .get(tok.as_str())?
+                        .map(|v| v.value().to_vec())
+                        .unwrap_or_default();
+                    let mut entries = decode_posting_list(&existing);
+                    entries.extend(new_entries);
+                    entries.sort_unstable_by_key(|(id, _)| *id);
+                    posts.insert(tok.as_str(), encode_posting_list(&entries).as_slice())?;
                 }
+                // Bump corpus meta.
+                let mut meta = txn.open_table(BM25_META)?;
+                let prev_n: u64 = meta
+                    .get("N")?
+                    .map(|v| u64_from_bytes(v.value()))
+                    .unwrap_or(0);
+                let prev_total: u64 = meta
+                    .get("total_length")?
+                    .map(|v| u64_from_bytes(v.value()))
+                    .unwrap_or(0);
+                meta.insert(
+                    "N",
+                    (prev_n + doc_count_delta).to_le_bytes().as_slice(),
+                )?;
+                meta.insert(
+                    "total_length",
+                    (prev_total + total_len_delta).to_le_bytes().as_slice(),
+                )?;
             }
             txn.commit()?;
         }
@@ -690,9 +748,10 @@ impl Palace {
         Ok(outcomes)
     }
 
-    /// Like `insert_drawer_in_txn` but skips trigram posting-list writes.
-    /// The caller aggregates trigrams across the batch and flushes once.
-    fn insert_drawer_in_txn_skip_trigrams(
+    /// Like `insert_drawer_in_txn` but skips BM25 posting-list and
+    /// corpus-meta writes. The caller aggregates tokens across the batch
+    /// and flushes once.
+    fn insert_drawer_in_txn_skip_bm25(
         &self,
         txn: &redb::WriteTransaction,
         input: Drawer,
@@ -720,7 +779,7 @@ impl Palace {
         txn: &redb::WriteTransaction,
         mut input: Drawer,
         embedding: Option<Vec<f32>>,
-        write_trigrams: bool,
+        write_bm25: bool,
     ) -> Result<DrawerInsertOutcome> {
         if let Some(ref e) = embedding {
             if e.len() != EMBEDDING_DIM {
@@ -836,30 +895,11 @@ impl Palace {
                     tbl.insert(id, bytes.as_slice())?;
                 }
 
-                // Trigram posting-list updates (R-141..R-143).
-                // Skipped when `write_trigrams == false` (batch callers
-                // aggregate and flush once per unique trigram instead).
-                let trigrams = if write_trigrams {
-                    extract_drawer_trigrams(&input.text)
-                } else {
-                    HashSet::new()
-                };
-                if !trigrams.is_empty() {
-                    let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
-                    for tri in trigrams {
-                        let key = tri.as_slice();
-                        let existing: Vec<u8> = {
-                            let fetched = tri_tbl.get(key)?.map(|v| v.value().to_vec());
-                            fetched.unwrap_or_default()
-                        };
-                        let mut ids = decode_u64_list(&existing);
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                            ids.sort_unstable();
-                        }
-                        let new_bytes = encode_u64_list(&ids);
-                        tri_tbl.insert(key, new_bytes.as_slice())?;
-                    }
+                // BM25 lexical index updates (R-141..R-143, schema v2).
+                // Skipped when `write_bm25 == false` (batch callers
+                // aggregate and flush once per unique token instead).
+                if write_bm25 {
+                    add_drawer_to_bm25(txn, id, &input.text)?;
                 }
 
                 // Persist next_drawer_id counter.
@@ -998,16 +1038,40 @@ impl Palace {
         Ok(out)
     }
 
-    /// Look up the drawer ids carrying a given trigram.
-    pub fn trigram_postings(&self, tri: &[u8; 3]) -> Result<Vec<u64>> {
+    /// Look up the BM25 posting list for a token: every drawer that
+    /// contains the token along with its term frequency.
+    pub fn bm25_postings(&self, token: &str) -> Result<Vec<(u64, u32)>> {
         let rtxn = self.db.begin_read()?;
-        let tbl = rtxn.open_table(DRAWER_TRIGRAMS)?;
-        let ids: Vec<u8>;
-        {
-            let fetched = tbl.get(tri.as_slice())?.map(|v| v.value().to_vec());
-            ids = fetched.unwrap_or_default();
-        }
-        Ok(decode_u64_list(&ids))
+        let tbl = rtxn.open_table(BM25_POSTINGS)?;
+        let bytes: Vec<u8> = tbl
+            .get(token)?
+            .map(|v| v.value().to_vec())
+            .unwrap_or_default();
+        Ok(decode_posting_list(&bytes))
+    }
+
+    /// Return (N, total_length, avg_dl) for BM25 scoring.
+    /// `avg_dl = 0` iff `N = 0` (empty corpus).
+    pub fn bm25_corpus_stats(&self) -> Result<(u64, u64, f32)> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(BM25_META)?;
+        let n: u64 = tbl
+            .get("N")?
+            .map(|v| u64_from_bytes(v.value()))
+            .unwrap_or(0);
+        let total: u64 = tbl
+            .get("total_length")?
+            .map(|v| u64_from_bytes(v.value()))
+            .unwrap_or(0);
+        let avg = if n == 0 { 0.0 } else { total as f32 / n as f32 };
+        Ok((n, total, avg))
+    }
+
+    /// Read a drawer's cached token length for BM25 scoring.
+    pub fn drawer_token_length(&self, id: u64) -> Result<u32> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(DRAWER_LENGTHS)?;
+        Ok(tbl.get(id)?.map(|v| v.value()).unwrap_or(0))
     }
 
     /// Look up the set of drawer ids in a given room (Phase 1 helper, now
@@ -1035,8 +1099,8 @@ impl Palace {
     ///
     /// Changing `text` recomputes the content hash, re-registers the
     /// drawer under its new hash (subject to collision dedup), and
-    /// regenerates the trigram posting list. Importance/room edits do
-    /// not touch the embedding or trigram index.
+    /// rebuilds its BM25 postings. Importance/room edits do not touch
+    /// the embedding or BM25 index.
     pub fn update_drawer(
         &self,
         id: u64,
@@ -1068,7 +1132,6 @@ impl Palace {
         let mut drawer: Drawer = serde_json::from_slice(&current_bytes)?;
         let old_room = drawer.room.clone();
         let old_hash_hex = drawer.content_hash.clone();
-        let old_text = drawer.text.clone();
 
         if let Some(r) = new_room {
             drawer.room = r.to_string();
@@ -1113,8 +1176,8 @@ impl Palace {
                 add_to_room_index(&txn, &drawer.room, id)?;
             }
 
-            // Hash re-registration and trigram rebuild if text changed.
-            if let Some(_) = new_text {
+            // Hash re-registration and BM25 index rebuild if text changed.
+            if new_text.is_some() {
                 // Remove old hash → id binding.
                 let old_hash_bytes = hex_decode_32(&old_hash_hex)
                     .context("stored content_hash is not valid hex")?;
@@ -1122,26 +1185,8 @@ impl Palace {
                     let mut by_hash = txn.open_table(DRAWER_BY_HASH)?;
                     by_hash.remove(old_hash_bytes.as_slice())?;
                 }
-                // Remove old trigrams.
-                let old_tris = extract_drawer_trigrams(&old_text);
-                if !old_tris.is_empty() {
-                    let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
-                    for tri in old_tris {
-                        let key = tri.as_slice();
-                        let ids_bytes: Vec<u8>;
-                        {
-                            let fetched = tri_tbl.get(key)?.map(|v| v.value().to_vec());
-                            ids_bytes = fetched.unwrap_or_default();
-                        }
-                        let mut ids = decode_u64_list(&ids_bytes);
-                        ids.retain(|x| *x != id);
-                        if ids.is_empty() {
-                            tri_tbl.remove(key)?;
-                        } else {
-                            tri_tbl.insert(key, encode_u64_list(&ids).as_slice())?;
-                        }
-                    }
-                }
+                // Drop old BM25 contribution (postings, length, corpus meta).
+                remove_drawer_from_bm25(&txn, id)?;
 
                 // Insert new hash → id binding (dedup guard).
                 let new_hash_bytes = hex_decode_32(&drawer.content_hash)
@@ -1171,25 +1216,8 @@ impl Palace {
                     }
                 }
 
-                // Rebuild trigrams from new text.
-                let new_tris = extract_drawer_trigrams(&drawer.text);
-                if !new_tris.is_empty() {
-                    let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
-                    for tri in new_tris {
-                        let key = tri.as_slice();
-                        let ids_bytes: Vec<u8>;
-                        {
-                            let fetched = tri_tbl.get(key)?.map(|v| v.value().to_vec());
-                            ids_bytes = fetched.unwrap_or_default();
-                        }
-                        let mut ids = decode_u64_list(&ids_bytes);
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                            ids.sort_unstable();
-                        }
-                        tri_tbl.insert(key, encode_u64_list(&ids).as_slice())?;
-                    }
-                }
+                // Rebuild BM25 state from new text.
+                add_drawer_to_bm25(&txn, id, &drawer.text)?;
             }
 
             // Persist updated drawer row.
@@ -1202,9 +1230,10 @@ impl Palace {
     }
 
     /// Delete a drawer and cascade across every satellite table:
-    /// DRAWER_BY_HASH, DRAWER_EMBEDDINGS, DRAWERS_BY_ROOM, DRAWER_TRIGRAMS,
-    /// FILE_DRAWER_XREF, SESSION_DRAWER_XREF, COMMIT_DRAWER_XREF (best-effort
-    /// scan), and LINKS in both directions (R-124).
+    /// DRAWER_BY_HASH, DRAWER_EMBEDDINGS, DRAWERS_BY_ROOM, BM25_POSTINGS,
+    /// DRAWERS_BY_TOKEN, DRAWER_LENGTHS, BM25_META, FILE_DRAWER_XREF,
+    /// SESSION_DRAWER_XREF, COMMIT_DRAWER_XREF (best-effort scan), and
+    /// LINKS in both directions (R-124).
     pub fn delete_drawer(&self, id: u64) -> Result<bool> {
         // Fetch full row first so we know what indexes to clean.
         let bytes: Option<Vec<u8>> = {
@@ -1237,26 +1266,8 @@ impl Palace {
             }
             // Room index.
             remove_from_room_index(&txn, &drawer.room, id)?;
-            // Trigram postings.
-            let tris = extract_drawer_trigrams(&drawer.text);
-            if !tris.is_empty() {
-                let mut tri_tbl = txn.open_table(DRAWER_TRIGRAMS)?;
-                for tri in tris {
-                    let key = tri.as_slice();
-                    let ids_bytes: Vec<u8>;
-                    {
-                        let fetched = tri_tbl.get(key)?.map(|v| v.value().to_vec());
-                        ids_bytes = fetched.unwrap_or_default();
-                    }
-                    let mut ids = decode_u64_list(&ids_bytes);
-                    ids.retain(|x| *x != id);
-                    if ids.is_empty() {
-                        tri_tbl.remove(key)?;
-                    } else {
-                        tri_tbl.insert(key, encode_u64_list(&ids).as_slice())?;
-                    }
-                }
-            }
+            // BM25 lexical index.
+            remove_drawer_from_bm25(&txn, id)?;
             // File xref.
             if let Some(fp) = drawer.source_file.as_deref() {
                 remove_from_string_index(&txn, FILE_DRAWER_XREF, fp, id)?;
@@ -1672,8 +1683,11 @@ impl Palace {
     /// Combines two signals (R-901):
     ///   1. `FILE_DRAWER_XREF[file_path]` — drawers whose `source_file`
     ///      matches the given path (project-relative).
-    ///   2. Trigram-narrowed candidates whose text contains the file's
-    ///      basename as a literal substring.
+    ///   2. Full-scan substring search for the basename in drawer text.
+    ///      Palace corpora are small (~10³ drawers); a direct scan keeps
+    ///      the code simple now that trigrams no longer exist for drawer
+    ///      text. If scale becomes a concern, the BM25 token index could
+    ///      be reused for basename-token candidate narrowing.
     ///
     /// Results are deduped and ordered by importance desc, updated_at
     /// desc (R-902).
@@ -1693,42 +1707,23 @@ impl Palace {
             candidates.insert(id);
         }
 
-        // Trigram basename mention.
+        // Basename substring mention across the full corpus.
         let basename = std::path::Path::new(file_path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| file_path.to_string());
         if !basename.is_empty() {
-            let query_tris = extract_query_trigrams(&basename);
-            if !query_tris.is_empty() {
-                // Intersect: a candidate drawer must carry every query trigram.
-                let mut first = true;
-                let mut running: std::collections::HashSet<u64> =
-                    std::collections::HashSet::new();
-                for tri in &query_tris {
-                    let posting = self.trigram_postings(tri)?;
-                    let set: std::collections::HashSet<u64> =
-                        posting.into_iter().collect();
-                    if first {
-                        running = set;
-                        first = false;
-                    } else {
-                        running.retain(|id| set.contains(id));
-                        if running.is_empty() {
-                            break;
-                        }
-                    }
+            let rtxn = self.db.begin_read()?;
+            let drawers_tbl = rtxn.open_table(DRAWERS)?;
+            for entry in drawers_tbl.iter()? {
+                let (k, v) = entry?;
+                let id = k.value();
+                if candidates.contains(&id) {
+                    continue;
                 }
-                // Confirm by substring.
-                let rtxn = self.db.begin_read()?;
-                let drawers_tbl = rtxn.open_table(DRAWERS)?;
-                for id in running {
-                    if let Some(v) = drawers_tbl.get(id)? {
-                        let d: Drawer = serde_json::from_slice(v.value())?;
-                        if d.text.contains(&basename) {
-                            candidates.insert(id);
-                        }
-                    }
+                let d: Drawer = serde_json::from_slice(v.value())?;
+                if d.text.contains(&basename) {
+                    candidates.insert(id);
                 }
             }
         }
@@ -1858,6 +1853,77 @@ impl Palace {
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         Ok(out)
+    }
+
+    /// Drop every BM25 table and re-tokenize every drawer. Does not touch
+    /// embeddings. Used by `ndx recall rebuild-index` when the tokenizer
+    /// changes or when corruption is suspected.
+    pub fn rebuild_bm25_index(&self) -> Result<u64> {
+        // Snapshot drawer texts first (read-only) so the rebuild write
+        // txn does not race with concurrent inserts.
+        let drawers: Vec<(u64, String)> = {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(DRAWERS)?;
+            let mut out = Vec::new();
+            for entry in tbl.iter()? {
+                let (k, v) = entry?;
+                let d: Drawer = serde_json::from_slice(v.value())?;
+                out.push((k.value(), d.text));
+            }
+            out
+        };
+
+        let mut count: u64 = 0;
+        // Rebuild in MINE_BATCH_SIZE chunks so the first chunk can wipe
+        // state and subsequent chunks append.
+        let chunks: Vec<_> = drawers.chunks(MINE_BATCH_SIZE).collect();
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let txn = self.db.begin_write()?;
+            if chunk_idx == 0 {
+                // Truncate all four BM25 tables.
+                {
+                    let mut posts = txn.open_table(BM25_POSTINGS)?;
+                    let keys: Vec<String> = posts
+                        .iter()?
+                        .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                        .collect();
+                    for k in keys {
+                        posts.remove(k.as_str())?;
+                    }
+                }
+                {
+                    let mut rev = txn.open_table(DRAWERS_BY_TOKEN)?;
+                    let keys: Vec<u64> = rev
+                        .iter()?
+                        .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+                        .collect();
+                    for k in keys {
+                        rev.remove(k)?;
+                    }
+                }
+                {
+                    let mut lengths = txn.open_table(DRAWER_LENGTHS)?;
+                    let keys: Vec<u64> = lengths
+                        .iter()?
+                        .filter_map(|r| r.ok().map(|(k, _)| k.value()))
+                        .collect();
+                    for k in keys {
+                        lengths.remove(k)?;
+                    }
+                }
+                {
+                    let mut meta = txn.open_table(BM25_META)?;
+                    meta.insert("N", 0u64.to_le_bytes().as_slice())?;
+                    meta.insert("total_length", 0u64.to_le_bytes().as_slice())?;
+                }
+            }
+            for (id, text) in chunk.iter() {
+                add_drawer_to_bm25(&txn, *id, text)?;
+                count += 1;
+            }
+            txn.commit()?;
+        }
+        Ok(count)
     }
 
     /// Reembed all drawers currently missing an embedding row (or all of
@@ -2038,26 +2104,195 @@ fn hex_decode_32(hex: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Extract the set of 3-byte shingles present in a drawer's text.
-/// Bytes adjacent to NULs are skipped (treat text containing NUL as
-/// non-indexable). This is deliberately simpler than the line-aware
-/// `trigram::extract_trigrams_with_lines` used by the file index: drawer
-/// search doesn't need per-line granularity.
-pub fn extract_drawer_trigrams(text: &str) -> HashSet<[u8; 3]> {
-    let bytes = text.as_bytes();
-    let mut out: HashSet<[u8; 3]> = HashSet::new();
-    for window in bytes.windows(3) {
-        if !window.contains(&0) {
-            out.insert([window[0], window[1], window[2]]);
+/// Tokenize `text`, append this drawer's contribution to every posting
+/// list, store its document length and reverse-index row, and bump the
+/// corpus meta. Idempotent over token uniqueness only in the sense that
+/// callers must call `remove_drawer_from_bm25` first if the drawer was
+/// previously indexed.
+fn add_drawer_to_bm25(
+    txn: &redb::WriteTransaction,
+    id: u64,
+    text: &str,
+) -> Result<()> {
+    let tokens = bm25::tokenize(text);
+    if tokens.is_empty() {
+        // Still record a zero-length row so remove paths find something to
+        // decrement if the drawer later gets re-indexed with tokens.
+        let mut lengths = txn.open_table(DRAWER_LENGTHS)?;
+        lengths.insert(id, 0u32)?;
+        let mut rev = txn.open_table(DRAWERS_BY_TOKEN)?;
+        rev.insert(id, [].as_slice())?;
+        let mut meta = txn.open_table(BM25_META)?;
+        let prev_n: u64 = meta
+            .get("N")?
+            .map(|v| u64_from_bytes(v.value()))
+            .unwrap_or(0);
+        meta.insert("N", (prev_n + 1).to_le_bytes().as_slice())?;
+        return Ok(());
+    }
+
+    let tf = bm25::term_frequencies(&tokens);
+    let dl = tokens.len() as u32;
+    {
+        let mut lengths = txn.open_table(DRAWER_LENGTHS)?;
+        lengths.insert(id, dl)?;
+        let mut rev = txn.open_table(DRAWERS_BY_TOKEN)?;
+        rev.insert(id, encode_token_list(&tokens).as_slice())?;
+    }
+    {
+        let mut posts = txn.open_table(BM25_POSTINGS)?;
+        for (tok, count) in tf {
+            let existing: Vec<u8> = posts
+                .get(tok.as_str())?
+                .map(|v| v.value().to_vec())
+                .unwrap_or_default();
+            let mut entries = decode_posting_list(&existing);
+            match entries.binary_search_by_key(&id, |(eid, _)| *eid) {
+                Ok(pos) => entries[pos].1 = count,
+                Err(pos) => entries.insert(pos, (id, count)),
+            }
+            posts.insert(tok.as_str(), encode_posting_list(&entries).as_slice())?;
         }
+    }
+    {
+        let mut meta = txn.open_table(BM25_META)?;
+        let prev_n: u64 = meta
+            .get("N")?
+            .map(|v| u64_from_bytes(v.value()))
+            .unwrap_or(0);
+        let prev_total: u64 = meta
+            .get("total_length")?
+            .map(|v| u64_from_bytes(v.value()))
+            .unwrap_or(0);
+        meta.insert("N", (prev_n + 1).to_le_bytes().as_slice())?;
+        meta.insert(
+            "total_length",
+            (prev_total + dl as u64).to_le_bytes().as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Reverse of `add_drawer_to_bm25`: drop the drawer from every posting
+/// list it appears in (using the `DRAWERS_BY_TOKEN` cache), delete its
+/// length row, and decrement corpus meta. A no-op if the drawer has no
+/// length row (never indexed / already removed).
+fn remove_drawer_from_bm25(
+    txn: &redb::WriteTransaction,
+    id: u64,
+) -> Result<()> {
+    // Tokens this drawer contributed.
+    let tokens: Vec<String> = {
+        let tbl = txn.open_table(DRAWERS_BY_TOKEN)?;
+        let fetched = tbl.get(id)?.map(|v| v.value().to_vec());
+        match fetched {
+            Some(bytes) => decode_token_list(&bytes),
+            None => return Ok(()),
+        }
+    };
+    let dl: u32 = {
+        let tbl = txn.open_table(DRAWER_LENGTHS)?;
+        let fetched = tbl.get(id)?.map(|v| v.value());
+        fetched.unwrap_or(0)
+    };
+
+    // Deduplicate so we visit each posting list once; tokens was stored
+    // in document order with duplicates.
+    let unique: std::collections::HashSet<String> = tokens.into_iter().collect();
+    if !unique.is_empty() {
+        let mut posts = txn.open_table(BM25_POSTINGS)?;
+        for tok in unique {
+            let existing: Vec<u8> = posts
+                .get(tok.as_str())?
+                .map(|v| v.value().to_vec())
+                .unwrap_or_default();
+            let mut entries = decode_posting_list(&existing);
+            entries.retain(|(eid, _)| *eid != id);
+            if entries.is_empty() {
+                posts.remove(tok.as_str())?;
+            } else {
+                posts.insert(tok.as_str(), encode_posting_list(&entries).as_slice())?;
+            }
+        }
+    }
+    {
+        let mut rev = txn.open_table(DRAWERS_BY_TOKEN)?;
+        rev.remove(id)?;
+    }
+    {
+        let mut lengths = txn.open_table(DRAWER_LENGTHS)?;
+        lengths.remove(id)?;
+    }
+    {
+        let mut meta = txn.open_table(BM25_META)?;
+        let prev_n: u64 = meta
+            .get("N")?
+            .map(|v| u64_from_bytes(v.value()))
+            .unwrap_or(0);
+        let prev_total: u64 = meta
+            .get("total_length")?
+            .map(|v| u64_from_bytes(v.value()))
+            .unwrap_or(0);
+        let new_n = prev_n.saturating_sub(1);
+        let new_total = prev_total.saturating_sub(dl as u64);
+        meta.insert("N", new_n.to_le_bytes().as_slice())?;
+        meta.insert("total_length", new_total.to_le_bytes().as_slice())?;
+    }
+    Ok(())
+}
+
+/// Encode a BM25 posting list: pairs of (u64 drawer_id, u32 tf) in
+/// little-endian, 12 bytes per entry. Matches the hand-rolled encoding
+/// used elsewhere in this module (`encode_u64_list`, etc.) — avoids
+/// pulling in bincode for a format that will never leave redb.
+fn encode_posting_list(entries: &[(u64, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(entries.len() * 12);
+    for (id, tf) in entries {
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(&tf.to_le_bytes());
     }
     out
 }
 
-/// Extract unique query trigrams for L3 lexical lookup.
-pub fn extract_query_trigrams(query: &str) -> HashSet<[u8; 3]> {
-    extract_drawer_trigrams(query)
+fn decode_posting_list(b: &[u8]) -> Vec<(u64, u32)> {
+    b.chunks_exact(12)
+        .map(|c| {
+            let id = u64::from_le_bytes([
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+            ]);
+            let tf = u32::from_le_bytes([c[8], c[9], c[10], c[11]]);
+            (id, tf)
+        })
+        .collect()
 }
+
+fn encode_token_list(tokens: &[String]) -> Vec<u8> {
+    // `<u32 len><bytes>` repeated. Tokens contain no NUL.
+    let mut out = Vec::new();
+    for t in tokens {
+        let bytes = t.as_bytes();
+        let len = bytes.len() as u32;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+fn decode_token_list(mut b: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    while b.len() >= 4 {
+        let len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        b = &b[4..];
+        if b.len() < len {
+            break;
+        }
+        let tok = String::from_utf8_lossy(&b[..len]).into_owned();
+        out.push(tok);
+        b = &b[len..];
+    }
+    out
+}
+
 
 /// Truncate a `String` in place at the nearest char boundary at or
 /// before `max_bytes`. Avoids panics from `String::truncate` when the
@@ -2533,5 +2768,172 @@ mod tests {
         assert!(validate_room_name("Bad").is_err());
         assert!(validate_room_name("").is_err());
         assert!(validate_room_name(&"a".repeat(65)).is_err());
+    }
+
+    fn mk_drawer(text: &str) -> Drawer {
+        Drawer {
+            id: 0,
+            text: text.into(),
+            content_hash: String::new(),
+            room: UNCLASSIFIED_ROOM.to_string(),
+            wing: None,
+            importance: 5,
+            source_kind: SourceKind::Manual,
+            source_session_id: None,
+            source_file: None,
+            source_line: None,
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn bm25_indexes_on_insert_and_meta_tracks_corpus() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+
+        let a = p
+            .insert_drawer_no_embedding(mk_drawer("switched database engine to postgres"))
+            .unwrap();
+        let b = p
+            .insert_drawer_no_embedding(mk_drawer("postgres replaced sqlite"))
+            .unwrap();
+        let _c = p
+            .insert_drawer_no_embedding(mk_drawer("unrelated note about caching"))
+            .unwrap();
+
+        // Corpus meta reflects three documents.
+        let (n, total, avg) = p.bm25_corpus_stats().unwrap();
+        assert_eq!(n, 3);
+        assert!(total > 0);
+        assert!(avg > 0.0);
+
+        // "postgres" appears in exactly two docs (a, b).
+        let posts = p.bm25_postings("postgres").unwrap();
+        let ids: std::collections::HashSet<u64> = posts.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&a.id));
+        assert!(ids.contains(&b.id));
+        assert_eq!(ids.len(), 2);
+
+        // Stopword "to" must have been dropped at tokenization time.
+        assert!(p.bm25_postings("to").unwrap().is_empty());
+    }
+
+    #[test]
+    fn bm25_cascades_on_delete() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+
+        let a = p
+            .insert_drawer_no_embedding(mk_drawer("rust async runtime tokio"))
+            .unwrap();
+        let b = p
+            .insert_drawer_no_embedding(mk_drawer("rust compiler diagnostics"))
+            .unwrap();
+
+        let (n_before, total_before, _) = p.bm25_corpus_stats().unwrap();
+        assert_eq!(n_before, 2);
+        let rust_before = p.bm25_postings("rust").unwrap();
+        assert_eq!(rust_before.len(), 2);
+
+        assert!(p.delete_drawer(a.id).unwrap());
+
+        let (n_after, total_after, _) = p.bm25_corpus_stats().unwrap();
+        assert_eq!(n_after, 1, "N decremented");
+        assert!(
+            total_after < total_before,
+            "total_length decreased"
+        );
+        let rust_after = p.bm25_postings("rust").unwrap();
+        assert_eq!(rust_after.len(), 1);
+        assert_eq!(rust_after[0].0, b.id);
+        // The token 'tokio' was unique to the deleted drawer, its posting
+        // list should be empty.
+        assert!(p.bm25_postings("tokio").unwrap().is_empty());
+    }
+
+    #[test]
+    fn bm25_rebuilds_on_text_update() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        let a = p
+            .insert_drawer_no_embedding(mk_drawer("apple banana cherry"))
+            .unwrap();
+        assert_eq!(p.bm25_postings("apple").unwrap().len(), 1);
+
+        p.update_drawer(a.id, None, None, Some("durian elderberry")).unwrap();
+
+        // Old tokens are gone; new tokens are indexed.
+        assert!(p.bm25_postings("apple").unwrap().is_empty());
+        assert!(p.bm25_postings("banana").unwrap().is_empty());
+        assert_eq!(p.bm25_postings("durian").unwrap().len(), 1);
+        assert_eq!(p.bm25_postings("elderberry").unwrap().len(), 1);
+
+        // Corpus stats remain consistent (still one document).
+        let (n, _, _) = p.bm25_corpus_stats().unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rebuild_bm25_index_recovers_state() {
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("alpha beta gamma"))
+            .unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("beta gamma delta"))
+            .unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("gamma delta epsilon"))
+            .unwrap();
+
+        let count = p.rebuild_bm25_index().unwrap();
+        assert_eq!(count, 3);
+
+        // After rebuild, corpus stats and postings agree with the
+        // insert-time state (idempotent).
+        let (n, _, _) = p.bm25_corpus_stats().unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(p.bm25_postings("gamma").unwrap().len(), 3);
+        assert_eq!(p.bm25_postings("alpha").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn l3_lexical_ranks_by_bm25() {
+        use crate::recall::search::{search, SearchMode};
+        let dir = tmp_project();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+
+        // Doc A: rare term appears twice in a short doc → should rank high.
+        let a = p
+            .insert_drawer_no_embedding(mk_drawer("tokio tokio runtime"))
+            .unwrap();
+        // Doc B: rare term once in a longer doc.
+        let b = p
+            .insert_drawer_no_embedding(mk_drawer(
+                "tokio runtime provides asynchronous primitives for networking",
+            ))
+            .unwrap();
+        // Doc C: no match at all.
+        let _c = p
+            .insert_drawer_no_embedding(mk_drawer("unrelated filesystem notes"))
+            .unwrap();
+        // Docs D/E: common term only — shouldn't outrank A or B for "tokio".
+        p.insert_drawer_no_embedding(mk_drawer("runtime benchmarks"))
+            .unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("runtime configuration knobs"))
+            .unwrap();
+
+        let hits = search(&p, "tokio", SearchMode::Lexical, None, 10).unwrap();
+        // At minimum, A and B appear and A outranks B (higher tf, shorter doc).
+        let ids: Vec<u64> = hits.iter().map(|h| h.drawer.id).collect();
+        let pos_a = ids.iter().position(|id| *id == a.id);
+        let pos_b = ids.iter().position(|id| *id == b.id);
+        assert!(pos_a.is_some(), "doc A should be in hits");
+        assert!(pos_b.is_some(), "doc B should be in hits");
+        assert!(
+            pos_a.unwrap() < pos_b.unwrap(),
+            "doc A (tf=2, shorter) should outrank doc B (tf=1, longer)"
+        );
     }
 }
