@@ -14,6 +14,16 @@ pub struct HookInput {
     pub tool_input: Option<ToolInput>,
     #[serde(default)]
     pub hook_event_name: Option<String>,
+    // PreCompact-only fields; harmless for other events.
+    #[serde(default)]
+    pub trigger: Option<String>,
+    // `custom_instructions` is part of the PreCompact schema but is
+    // not consumed today. Keep the field deserialized (so unknown
+    // fields don't trip us up if we ever flip serde's deny_unknown)
+    // but mark it allow-dead-code until a use-case arrives.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub custom_instructions: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +51,28 @@ pub struct HookSpecificOutput {
 #[derive(Debug, Serialize)]
 pub struct UpdatedInput {
     pub command: String,
+}
+
+// ── PreCompact output ────────────────────────────────────────────────
+//
+// PreCompact's `hookSpecificOutput` shape is narrower than PreToolUse —
+// no `permissionDecision`, no `updatedInput`, just `hookEventName` and
+// (optionally) `additionalContext`. Using a distinct struct keeps the
+// JSON clean and avoids emitting irrelevant fields that Claude Code
+// might reject or warn about.
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreCompactOutput {
+    pub hook_specific_output: PreCompactSpecificOutput,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreCompactSpecificOutput {
+    pub hook_event_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<String>,
 }
 
 pub fn handle_hook(stdin_json: &str) -> Result<Option<HookOutput>> {

@@ -462,7 +462,10 @@ pub fn run_install() -> Result<()> {
     // 3. Register hook in ~/.claude/settings.json (no MCP server)
     let settings_path = home.join(".claude").join("settings.json");
     register_claude_settings(&settings_path, &ndx_bin_str)?;
-    eprintln!("  Hook: PreToolUse Bash hook registered in {}", settings_path.display());
+    eprintln!(
+        "  Hook: PreToolUse (Bash) + PreCompact hooks registered in {}",
+        settings_path.display()
+    );
 
     // 4. Install global skills (main ndx.md + 5 recall slash commands)
     let skill_dir = home.join(".claude").join("commands");
@@ -642,11 +645,12 @@ fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()
         }
     }
 
-    // Register PreToolUse hook
+    // Register PreToolUse + PreCompact hooks
     let hooks = obj
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
     if let Some(hooks_obj) = hooks.as_object_mut() {
+        // ── PreToolUse (Bash) ─────────────────────────────────────────
         let pre_tool_use = hooks_obj
             .entry("PreToolUse")
             .or_insert_with(|| serde_json::json!([]));
@@ -682,10 +686,142 @@ fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()
                 }]
             }));
         }
+
+        // ── PreCompact (no matcher → fires for manual + auto) ─────────
+        let pre_compact = hooks_obj
+            .entry("PreCompact")
+            .or_insert_with(|| serde_json::json!([]));
+
+        if let Some(arr) = pre_compact.as_array_mut() {
+            // Remove existing ndx PreCompact entries so the refresh is
+            // idempotent and any command-path change (e.g., when the
+            // user moves ~/.local/bin/ndx) takes effect.
+            arr.retain(|entry| {
+                if let Some(hooks_arr) = entry.get("hooks").and_then(|v| v.as_array()) {
+                    for h in hooks_arr {
+                        if let Some(cmd) = h.get("command").and_then(|v| v.as_str()) {
+                            if cmd.contains("ndx") && cmd.contains("hook") {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            });
+
+            arr.push(serde_json::json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{} hook", ndx_bin),
+                    "timeout": 10,
+                    "statusMessage": "ndx: re-injecting recall palace wake-up..."
+                }]
+            }));
+        }
     }
 
     let output = serde_json::to_string_pretty(&settings)?;
     std::fs::write(settings_path, output)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Running `register_claude_settings` twice must not duplicate
+    /// either the PreToolUse or the PreCompact entry. Both must point
+    /// at the supplied `ndx_bin` path.
+    #[test]
+    fn register_claude_settings_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        let ndx_bin = "/tmp/fake/ndx";
+
+        register_claude_settings(&settings_path, ndx_bin).unwrap();
+        register_claude_settings(&settings_path, ndx_bin).unwrap();
+
+        let body = std::fs::read_to_string(&settings_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        let pre_tool = v
+            .pointer("/hooks/PreToolUse")
+            .and_then(|x| x.as_array())
+            .expect("PreToolUse array");
+        let ndx_pre_tool: Vec<_> = pre_tool
+            .iter()
+            .filter(|e| {
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|arr| {
+                        arr.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|c| c.contains("ndx"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            ndx_pre_tool.len(),
+            1,
+            "PreToolUse should have exactly one ndx entry after two installs"
+        );
+
+        let pre_compact = v
+            .pointer("/hooks/PreCompact")
+            .and_then(|x| x.as_array())
+            .expect("PreCompact array");
+        let ndx_pre_compact: Vec<_> = pre_compact
+            .iter()
+            .filter(|e| {
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|arr| {
+                        arr.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|c| c.contains("ndx"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            ndx_pre_compact.len(),
+            1,
+            "PreCompact should have exactly one ndx entry after two installs"
+        );
+
+        // Updating the bin path rewrites both entries, still idempotent.
+        let new_bin = "/usr/local/bin/ndx";
+        register_claude_settings(&settings_path, new_bin).unwrap();
+        let body2 = std::fs::read_to_string(&settings_path).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        let pre_compact2 = v2
+            .pointer("/hooks/PreCompact")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        let hits: Vec<_> = pre_compact2
+            .iter()
+            .filter(|e| {
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|arr| {
+                        arr.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|c| c.contains(new_bin))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "PreCompact must track the new bin path");
+    }
 }

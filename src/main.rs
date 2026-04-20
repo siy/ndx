@@ -375,6 +375,25 @@ fn cmd_hook() -> Result<()> {
     // Phase 5 wake-up injection path.
     let hook_input: Option<hook::HookInput> = serde_json::from_str(&input).ok();
 
+    // Dispatch on hook event name. PreCompact has its own output schema
+    // (narrower `hookSpecificOutput`) and must always re-inject the
+    // L0+L1 wake-up text to survive compaction. All other events fall
+    // through to the existing PreToolUse Bash flow.
+    if let Some(hi) = hook_input.as_ref() {
+        if hi.hook_event_name.as_deref() == Some("PreCompact") {
+            match build_precompact_output(hi) {
+                Ok(Some(out)) => {
+                    println!("{}", serde_json::to_string(&out)?);
+                }
+                Ok(None) => {} // silent soft-skip (no palace, no session, etc.)
+                Err(e) => {
+                    eprintln!("[ndx hook] PreCompact injection skipped: {}", e);
+                }
+            }
+            return Ok(());
+        }
+    }
+
     // Phase A/B: manifest-driven hook response.
     let mut response = match hook::handle_hook(&input) {
         Ok(r) => r,
@@ -493,6 +512,63 @@ fn try_inject_wake_up(
 
     palace.mark_wake_injected(session_id)?;
     Ok(())
+}
+
+/// PreCompact wake-up injection.
+///
+/// Claude Code calls `ndx hook` with `hook_event_name == "PreCompact"`
+/// before compacting a session (either manual `/compact` or automatic
+/// at the context limit). We re-inject the L0+L1 palace wake-up text
+/// via `hookSpecificOutput.additionalContext` so the palace context
+/// survives compaction.
+///
+/// Unlike the PreToolUse/Bash path, PreCompact:
+///   - ignores the `WAKE_INJECTED` per-session gate (different channel),
+///   - returns a narrower `hookSpecificOutput` (no permissionDecision).
+///
+/// All failure modes (missing cwd, missing palace, I/O error) return
+/// `Ok(None)` — soft-fail, no output, exit 0 — matching the PreToolUse
+/// handler's behavior. `Err(...)` is reserved for programming errors
+/// that the caller surfaces on stderr.
+fn build_precompact_output(
+    hi: &hook::HookInput,
+) -> Result<Option<hook::PreCompactOutput>> {
+    let cwd = match hi.cwd.as_deref() {
+        Some(c) if !c.is_empty() => std::path::PathBuf::from(c),
+        _ => return Ok(None),
+    };
+    let root = match find_palace_root(&cwd) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let palace = match Palace::open_at(root) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    let wake_text = match recall::search::wake_up(&palace) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+
+    let session_label = hi
+        .session_id
+        .as_deref()
+        .map(|s| recall::safe_prefix(s, 8).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let trigger = hi.trigger.as_deref().unwrap_or("unknown");
+    let block = format!(
+        "# ndx-recall wake-up (pre-compact session {} trigger={})\n{}\n# /wake-up\n",
+        session_label,
+        trigger,
+        wake_text.trim_end(),
+    );
+
+    Ok(Some(hook::PreCompactOutput {
+        hook_specific_output: hook::PreCompactSpecificOutput {
+            hook_event_name: "PreCompact".to_string(),
+            additional_context: Some(block),
+        },
+    }))
 }
 
 /// Walk up from a starting directory looking for an existing
@@ -1494,5 +1570,161 @@ fn dispatch(args: &[String]) -> Result<()> {
             print_usage();
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod precompact_tests {
+    use super::*;
+    use recall::{Drawer, SourceKind};
+    use std::collections::BTreeMap;
+
+    fn mk_drawer(text: &str, importance: u8, room: &str) -> Drawer {
+        Drawer {
+            id: 0,
+            text: text.to_string(),
+            content_hash: String::new(),
+            room: room.to_string(),
+            wing: None,
+            importance,
+            source_kind: SourceKind::Manual,
+            source_session_id: None,
+            source_file: None,
+            source_line: None,
+            source_commit: None,
+            created_at: 0,
+            updated_at: 0,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// Build a minimal palace at a temp dir with enough content to make
+    /// `wake_up()` return non-trivial text.
+    fn make_palace(tmp: &std::path::Path) -> Palace {
+        let palace = Palace::create_at(tmp.to_path_buf()).unwrap();
+        palace.ensure_room("architecture", None, None).unwrap();
+        palace
+            .insert_drawer_no_embedding(mk_drawer(
+                "Test project uses Rust edition 2021 and redb for storage.",
+                8,
+                "architecture",
+            ))
+            .unwrap();
+        palace
+    }
+
+    #[test]
+    fn precompact_returns_none_without_cwd() {
+        let hi = hook::HookInput {
+            session_id: Some("abc123".into()),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            hook_event_name: Some("PreCompact".into()),
+            trigger: Some("manual".into()),
+            custom_instructions: None,
+        };
+        let out = build_precompact_output(&hi).unwrap();
+        assert!(out.is_none(), "missing cwd must soft-fail with None");
+    }
+
+    #[test]
+    fn precompact_returns_none_when_no_palace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hi = hook::HookInput {
+            session_id: Some("abc123".into()),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            tool_name: None,
+            tool_input: None,
+            hook_event_name: Some("PreCompact".into()),
+            trigger: Some("auto".into()),
+            custom_instructions: None,
+        };
+        let out = build_precompact_output(&hi).unwrap();
+        assert!(out.is_none(), "no palace must soft-fail with None");
+    }
+
+    #[test]
+    fn precompact_emits_wake_up_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Drop the palace before invoking the handler — redb holds an
+        // exclusive lock on the db file while the handle is alive.
+        drop(make_palace(tmp.path()));
+
+        let hi = hook::HookInput {
+            session_id: Some("sess-pre-compact-0001".into()),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            tool_name: None,
+            tool_input: None,
+            hook_event_name: Some("PreCompact".into()),
+            trigger: Some("manual".into()),
+            custom_instructions: Some("".into()),
+        };
+        let out = build_precompact_output(&hi).unwrap().expect("output");
+
+        // JSON serialises to the exact shape Claude Code expects.
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            json.contains("\"hookEventName\":\"PreCompact\""),
+            "event name must be PreCompact in JSON: {}",
+            json
+        );
+        assert!(
+            json.contains("\"additionalContext\""),
+            "must carry additionalContext: {}",
+            json
+        );
+        // Must NOT emit PreToolUse-only fields.
+        assert!(
+            !json.contains("permissionDecision"),
+            "PreCompact output must not include permissionDecision: {}",
+            json
+        );
+        assert!(
+            !json.contains("updatedInput"),
+            "PreCompact output must not include updatedInput: {}",
+            json
+        );
+
+        let body = out
+            .hook_specific_output
+            .additional_context
+            .as_deref()
+            .unwrap();
+        assert!(body.contains("ndx-recall wake-up"));
+        assert!(body.contains("pre-compact"));
+        assert!(body.contains("trigger=manual"));
+        // Session id prefix (8 chars) appears.
+        assert!(body.contains("sess-pre"));
+        // The wake-up content itself (one of the L1 or L0 markers).
+        assert!(body.contains("L1") || body.contains("L0") || body.contains("Rust"));
+    }
+
+    /// PreCompact does NOT consult the per-session WAKE_INJECTED gate.
+    /// Running it twice for the same session must still produce output
+    /// both times.
+    #[test]
+    fn precompact_ignores_wake_injected_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let palace = make_palace(tmp.path());
+        // Pretend PreToolUse already injected for this session.
+        palace
+            .mark_wake_injected("already-seen-session")
+            .unwrap();
+        drop(palace);
+
+        let hi = hook::HookInput {
+            session_id: Some("already-seen-session".into()),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            tool_name: None,
+            tool_input: None,
+            hook_event_name: Some("PreCompact".into()),
+            trigger: Some("auto".into()),
+            custom_instructions: None,
+        };
+        let out1 = build_precompact_output(&hi).unwrap();
+        let out2 = build_precompact_output(&hi).unwrap();
+        assert!(out1.is_some(), "first call must emit");
+        assert!(out2.is_some(), "second call must still emit");
     }
 }
