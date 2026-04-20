@@ -10,8 +10,8 @@ Fast file index with trigram search, real-time file watching, episodic memory, *
 - **Gitignore-aware** — respects `.gitignore` rules, rebuilds matcher on changes
 - **Episodic memory** — indexes AI coding session transcripts for full-text search across past sessions
 - **Recall palace** — per-project structured memory with rooms, drawers, 4-layer retrieval ladder (identity → wake-up → room-filtered → hybrid search), local embeddings via `fastembed` + `all-MiniLM-L6-v2`
-- **Hybrid search** — semantic (cosine) + lexical (trigram) fused via RRF; wins over either alone on both exact identifiers and synonyms
-- **Command hooks** — PreToolUse hook injects CLI syntax hints, filters noisy output, and auto-injects wake-up context once per Claude session
+- **Hybrid search** — semantic (cosine) + lexical (BM25) fused via RRF; wins over either alone on both exact identifiers and synonyms
+- **Command hooks** — PreToolUse hook injects CLI syntax hints, filters noisy output, and auto-injects wake-up context once per Claude session; PreCompact hook re-injects wake-up before context compaction so palace context survives `/compact`
 - **Cross-referencing** — bridges file index, session memory, and recall palace ("which drawers touched this file?", "which drawers came from this commit?")
 - **Subagent-friendly** — pure CLI interface works from any context, including Claude Code subagents and team members
 - **Claude-curated quality** — five slash commands (`/ndx-recall-classify`, `-score`, `-dedupe`, `-contradict`, `-summarize`) delegate judgment work to Claude instead of brittle heuristics
@@ -33,7 +33,7 @@ CLI (ndx memory/xref file/session)
 
 CLI (ndx recall *, ndx xref drawer/drawer-session/git)
   └─ direct access ──► {project}/.ndx/recall.redb
-                          ├─ drawers + trigrams + embeddings
+                          ├─ drawers + BM25 index + embeddings
                           ├─ rooms + links
                           ├─ file/session/commit cross-references
                           └─ wake-up injection state
@@ -51,7 +51,7 @@ Memory and recall commands access their databases directly — no daemon needed.
 curl -fsSL https://raw.githubusercontent.com/siy/ndx/master/install.sh | bash
 ```
 
-Downloads a prebuilt binary from [GitHub Releases](https://github.com/siy/ndx/releases) (macOS ARM64/x86_64, Linux x86_64/aarch64). Falls back to building from source if no prebuilt is available. Installs to `~/.local/bin/ndx`, downloads 289 command manifests, registers the PreToolUse hook, and installs 7 slash commands. Restart Claude Code after install.
+Downloads a prebuilt binary from [GitHub Releases](https://github.com/siy/ndx/releases) (macOS ARM64/x86_64, Linux x86_64/aarch64). Falls back to building from source if no prebuilt is available. Installs to `~/.local/bin/ndx`, downloads 289 command manifests, registers the PreToolUse + PreCompact hooks, and installs 7 slash commands. Restart Claude Code after install.
 
 ### From source
 
@@ -111,7 +111,7 @@ ndx recall wake                                 # L0 identity + L1 top drawers (
 ndx recall get --room decisions --limit 10      # all decisions, ranked by importance
 ```
 
-The hook automatically injects wake-up context (L0 + L1) on the first Bash command of each Claude session — no manual `wake` needed.
+The PreToolUse hook automatically injects wake-up context (L0 + L1) on the first Bash command of each Claude session — no manual `wake` needed. The PreCompact hook re-injects the same wake-up block whenever Claude compacts its context (manual `/compact` or automatic at the context limit), so palace context survives compaction intact.
 
 ### 4. Maintain over time
 
@@ -201,7 +201,7 @@ ndx recall search "query" [flags]           # L3 hybrid (default), --semantic, -
 ndx recall search "query" --room decisions --limit 5
 ```
 
-L3 defaults to **hybrid search**: fastembed cosine similarity (top-50) fused with trigram intersection (top-50) via Reciprocal Rank Fusion (k=60). Semantic catches synonyms; lexical catches exact identifiers. Neither alone is sufficient.
+L3 defaults to **hybrid search**: fastembed cosine similarity (top-50) fused with Okapi BM25 (`k1 = 1.2, b = 0.75`, top-50) via Reciprocal Rank Fusion (k=60). Semantic catches synonyms; lexical catches exact identifiers. Neither alone is sufficient.
 
 #### Drawers
 
@@ -265,7 +265,7 @@ ndx init [path]                         # install ndx skill into a project
 
 ## Command Hook
 
-ndx acts as a PreToolUse hook, providing three phases for every Bash command:
+ndx registers two Claude Code hooks on `ndx install`. The PreToolUse Bash hook runs three phases for every Bash command (below); the PreCompact hook re-injects the L0+L1 recall-palace wake-up text before context compaction (manual `/compact` or automatic).
 
 **Phase A — Syntax injection:** Before execution, injects CLI syntax hints (key flags, preferred invocations) from YAML manifests into the agent's context.
 
@@ -295,7 +295,7 @@ ndx uses the same YAML manifest format as [kcp-commands](https://github.com/Cant
 | Database | Location | Contents |
 |----------|----------|----------|
 | Project index | `{project}/.ndx/index.redb` | File metadata, trigram content index |
-| Recall palace | `{project}/.ndx/recall.redb` | Drawers, rooms, links, embeddings, trigrams, xrefs, wake state |
+| Recall palace | `{project}/.ndx/recall.redb` | Drawers, rooms, links, embeddings, BM25 index, xrefs, wake state |
 | Per-project identity | `{project}/.ndx/identity.toml` | Optional per-project identity override (TOML) |
 | Daemon socket | `{project}/.ndx/ndx.sock` | Unix domain socket for client-daemon IPC |
 | Daemon log | `{project}/.ndx/ndx.log` | Daemon stderr output |
