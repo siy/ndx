@@ -1454,7 +1454,9 @@ fn cmd_recall_reembed(args: &[String]) -> Result<()> {
 }
 
 fn cmd_recall_rebuild_index(_args: &[String]) -> Result<()> {
-    let palace = Palace::open_from_cwd()?;
+    let root = Palace::find()?
+        .ok_or_else(|| anyhow::Error::from(RecallError::not_initialized()))?;
+    let palace = Palace::open_for_migration(root)?;
     let count = palace.rebuild_bm25_index()?;
     eprintln!("rebuilt BM25 index for {} drawers", count);
     Ok(())

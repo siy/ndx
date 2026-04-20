@@ -266,7 +266,19 @@ impl Palace {
         if !db_path.exists() {
             return Err(RecallError::not_initialized().into());
         }
-        Self::open_or_create(project_root, db_path, false)
+        Self::open_or_create(project_root, db_path, false, false)
+    }
+
+    /// Open a palace without enforcing the schema-version equality check.
+    /// Only used by `ndx recall rebuild-index` so a v1 palace can be opened
+    /// long enough to rebuild its BM25 tables and bump the version to v2.
+    /// Still rejects palaces newer than the binary supports.
+    pub fn open_for_migration(project_root: PathBuf) -> Result<Self> {
+        let db_path = project_root.join(".ndx").join("recall.redb");
+        if !db_path.exists() {
+            return Err(RecallError::not_initialized().into());
+        }
+        Self::open_or_create(project_root, db_path, false, true)
     }
 
     /// Create (or reopen) the palace at a specific project root. Used by
@@ -277,13 +289,14 @@ impl Palace {
             format!("creating {}", ndx_dir.display())
         })?;
         let db_path = ndx_dir.join("recall.redb");
-        Self::open_or_create(project_root, db_path, true)
+        Self::open_or_create(project_root, db_path, true, false)
     }
 
     fn open_or_create(
         project_root: PathBuf,
         db_path: PathBuf,
         init: bool,
+        allow_stale_version: bool,
     ) -> Result<Self> {
         let db = Database::create(&db_path)
             .with_context(|| format!("opening {}", db_path.display()))?;
@@ -328,7 +341,7 @@ impl Palace {
                         ))
                         .into());
                     }
-                    if stored < SCHEMA_VERSION {
+                    if stored < SCHEMA_VERSION && !allow_stale_version {
                         return Err(RecallError::schema_version(format!(
                             "palace schema version {} is older than supported {} \
                              (lexical index changed from trigrams to BM25). \
@@ -1923,6 +1936,21 @@ impl Palace {
             }
             txn.commit()?;
         }
+
+        // Stamp current schema version so subsequent opens via the strict
+        // path succeed. Safe to run on an already-current palace too.
+        {
+            let txn = self.db.begin_write()?;
+            {
+                let mut meta = txn.open_table(META)?;
+                meta.insert(
+                    "schema_version",
+                    SCHEMA_VERSION.to_le_bytes().as_slice(),
+                )?;
+            }
+            txn.commit()?;
+        }
+
         Ok(count)
     }
 
@@ -2896,6 +2924,41 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(p.bm25_postings("gamma").unwrap().len(), 3);
         assert_eq!(p.bm25_postings("alpha").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_for_migration_bumps_stale_schema_version() {
+        let dir = tmp_project();
+        let root = dir.path().to_path_buf();
+        {
+            let p = Palace::create_at(root.clone()).unwrap();
+            p.insert_drawer_no_embedding(mk_drawer("alpha beta"))
+                .unwrap();
+            // Simulate a v1 palace by rewriting the stored schema_version.
+            let txn = p.db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(META).unwrap();
+                meta.insert("schema_version", 1u32.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        // Strict open rejects a stale version.
+        let err = match Palace::open_at(root.clone()) {
+            Ok(_) => panic!("open_at should reject stale schema"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("rebuild-index"), "{}", err);
+
+        // Migration open + rebuild stamps the current version.
+        let p = Palace::open_for_migration(root.clone()).unwrap();
+        p.rebuild_bm25_index().unwrap();
+        drop(p);
+
+        // Subsequent strict open succeeds.
+        let p = Palace::open_at(root).unwrap();
+        assert_eq!(p.stats().unwrap().schema_version, SCHEMA_VERSION);
     }
 
     #[test]
