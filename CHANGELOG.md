@@ -1,6 +1,8 @@
 # Changelog
 
-## v0.7.0 — Unreleased
+## v0.8.0 — Unreleased
+
+## v0.7.0 — 2026-04-20
 
 - **BM25 lexical search** — the L3 lexical channel now scores candidates with Okapi BM25 over a tokenizer (lowercase, split on non-alphanumeric, drop tokens shorter than 2 chars, drop a 31-word English stopword list). Replaces the previous drawer-text trigram hit-count ranker. Parameters `k1 = 1.2`, `b = 0.75` — scientific default and the Anthropic contextual retrieval baseline. Hybrid search (semantic + lexical via RRF) now reliably beats lexical-only on synonym and rare-term queries.
 - **Palace schema v2** — `drawer_trigrams` and `drawers_by_trigram` dropped. New tables `bm25_postings`, `drawers_by_token`, `drawer_lengths`, `bm25_meta`. Daemon code-index trigrams (`src/trigram.rs`, `src/memory/mod.rs`) are unaffected — they stay the right tool for code substring search.
