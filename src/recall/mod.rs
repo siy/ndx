@@ -42,7 +42,10 @@ pub use error::{ExitCode, RecallError};
 ///      tables `bm25_postings`, `drawers_by_token`, `drawer_lengths`,
 ///      `bm25_meta`. No auto-migration; palaces predating v2 must be
 ///      rebuilt via `ndx recall rebuild-index`.
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3 — shared palaces (R-1000..R-1072). Adds `canonical_root` META
+///      entry; `source_file` is stored canonically-relative. Upgrade
+///      via `ndx recall rebuild-index`.
+pub const SCHEMA_VERSION: u32 = 3;
 pub const UNCLASSIFIED_ROOM: &str = "unclassified";
 pub const DEFAULT_IMPORTANCE: u8 = 5;
 pub const MAX_DRAWER_TEXT_BYTES: usize = 8 * 1024;
@@ -222,6 +225,14 @@ pub struct PalaceStats {
     pub embedding_model: Option<String>,
     pub last_mined_at: Option<i64>,
     pub created_at: Option<i64>,
+    /// Canonical project root stamped at init (or on `rebuild-index` for
+    /// migrated palaces). `None` on pre-v3 palaces. R-1072.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_root: Option<String>,
+    /// Resolved target of the `recall.redb` symlink, if any. R-1072.
+    /// Null in JSON when the local palace file is not a symlink.
+    #[serde(default)]
+    pub palace_linked_to: Option<String>,
 }
 
 // ── Palace ──
@@ -343,8 +354,7 @@ impl Palace {
                     }
                     if stored < SCHEMA_VERSION && !allow_stale_version {
                         return Err(RecallError::schema_version(format!(
-                            "palace schema version {} is older than supported {} \
-                             (lexical index changed from trigrams to BM25). \
+                            "palace schema version {} is older than supported {}. \
                              Run `ndx recall rebuild-index` to upgrade.",
                             stored, SCHEMA_VERSION
                         ))
@@ -369,6 +379,15 @@ impl Palace {
                             "created_at",
                             now_unix().to_le_bytes().as_slice(),
                         )?;
+                        // Schema v3: stamp canonical_root at init time.
+                        // `project_root` is the absolute path at which the
+                        // palace was created; linked secondaries never hit
+                        // this branch because they symlink an existing
+                        // database whose META already carries the field.
+                        let abs = absolute_path(&project_root);
+                        if let Some(s) = abs.to_str() {
+                            meta.insert("canonical_root", s.as_bytes())?;
+                        }
                     }
                     wtxn.commit()?;
                 }
@@ -430,6 +449,35 @@ impl Palace {
 
     pub fn db_path(&self) -> PathBuf {
         self.project_root.join(".ndx").join("recall.redb")
+    }
+
+    /// Absolute path to the canonical project root stored in META, if set.
+    /// Returns `None` on a pre-v3 palace that hasn't been rebuilt yet.
+    pub fn canonical_root(&self) -> Result<Option<PathBuf>> {
+        let rtxn = self.db.begin_read()?;
+        let meta = rtxn.open_table(META)?;
+        Ok(meta
+            .get("canonical_root")?
+            .and_then(|v| String::from_utf8(v.value().to_vec()).ok())
+            .map(PathBuf::from))
+    }
+
+    /// Rewrite the canonical_root META entry. Used by `ndx recall rehome`.
+    /// Does not move the palace file and does not re-normalize drawer
+    /// `source_file` entries (spec R-1034).
+    pub fn set_canonical_root(&self, new_root: &Path) -> Result<()> {
+        let abs = absolute_path(new_root);
+        let s = abs
+            .to_str()
+            .context("canonical_root must be valid UTF-8")?
+            .to_string();
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            meta.insert("canonical_root", s.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     // ── Meta ──
@@ -807,6 +855,16 @@ impl Palace {
             safe_truncate(&mut input.text, MAX_DRAWER_TEXT_BYTES.saturating_sub(16));
             input.text.push_str("… [truncated]");
         }
+        // R-1021: normalize `source_file` against canonical_root before
+        // storage so every write path shares the same representation.
+        if let Some(ref sf) = input.source_file {
+            let canonical = read_canonical_root(txn)?;
+            if let Some(root) = canonical {
+                let normalized =
+                    normalize_source_file(&root, Path::new(sf));
+                input.source_file = Some(normalized.to_string_lossy().into_owned());
+            }
+        }
         let hash = blake3::hash(input.text.as_bytes());
         let hash_bytes: [u8; 32] = *hash.as_bytes();
         input.content_hash = hash.to_hex().to_string();
@@ -1025,6 +1083,12 @@ impl Palace {
             .get("created_at")?
             .map(|v| i64_from_bytes(v.value()));
 
+        let canonical_root = meta
+            .get("canonical_root")?
+            .and_then(|v| String::from_utf8(v.value().to_vec()).ok());
+
+        let palace_linked_to = symlink_resolved_target(&self.db_path());
+
         Ok(PalaceStats {
             drawer_count,
             room_count,
@@ -1033,6 +1097,8 @@ impl Palace {
             embedding_model,
             last_mined_at,
             created_at,
+            canonical_root,
+            palace_linked_to,
         })
     }
 
@@ -1527,13 +1593,25 @@ impl Palace {
 
         // Collect matching ids. We match both exact and prefix so that
         // `--source-file docs/` covers all files under docs/.
+        //
+        // R-1023/R-1024: callers may pass absolute or cwd-relative paths;
+        // normalize to canonical-relative form before matching so shared
+        // palaces (where stored paths are always canonical-relative) hit.
+        let canonical = self.canonical_root()?;
+        let resolved = resolve_query_path(canonical.as_deref(), source_file);
+        let resolved_str = resolved.to_string_lossy().into_owned();
         let all = self.list_drawers(None, usize::MAX, 0)?;
         let matching_ids: Vec<u64> = all
             .iter()
             .filter(|d| {
                 d.source_file
                     .as_deref()
-                    .map(|f| f == source_file || f.starts_with(source_file))
+                    .map(|f| {
+                        f == source_file
+                            || f.starts_with(source_file)
+                            || f == resolved_str.as_str()
+                            || f.starts_with(resolved_str.as_str())
+                    })
                     .unwrap_or(false)
             })
             .map(|d| d.id)
@@ -1708,16 +1786,29 @@ impl Palace {
         use std::collections::BTreeSet;
         let mut candidates: BTreeSet<u64> = BTreeSet::new();
 
-        // Direct source_file match.
-        let direct: Vec<u8>;
-        {
+        // R-1023: resolve the query path to canonical-relative form.
+        // Strategy:
+        //   * absolute inside canonical_root → strip prefix
+        //   * relative → assume cwd-relative; canonicalize if possible,
+        //     then strip; fall back to the raw input on failure
+        // We also keep the raw `file_path` as a secondary lookup key so
+        // callers that already passed a project-relative string still hit.
+        let canonical = self.canonical_root()?;
+        let resolved = resolve_query_path(canonical.as_deref(), file_path);
+        let resolved_str = resolved.to_string_lossy().into_owned();
+
+        // Direct source_file match — try resolved form first, then raw
+        // input, deduped via the BTreeSet.
+        for key in [resolved_str.as_str(), file_path] {
             let rtxn = self.db.begin_read()?;
             let tbl = rtxn.open_table(FILE_DRAWER_XREF)?;
-            let fetched = tbl.get(file_path)?.map(|v| v.value().to_vec());
-            direct = fetched.unwrap_or_default();
-        }
-        for id in decode_u64_list(&direct) {
-            candidates.insert(id);
+            let fetched: Vec<u8> = tbl
+                .get(key)?
+                .map(|v| v.value().to_vec())
+                .unwrap_or_default();
+            for id in decode_u64_list(&fetched) {
+                candidates.insert(id);
+            }
         }
 
         // Basename substring mention across the full corpus.
@@ -1868,9 +1959,10 @@ impl Palace {
         Ok(out)
     }
 
-    /// Drop every BM25 table and re-tokenize every drawer. Does not touch
-    /// embeddings. Used by `ndx recall rebuild-index` when the tokenizer
-    /// changes or when corruption is suspected.
+    /// Drop every BM25 table and re-tokenize every drawer, then stamp
+    /// schema v3 metadata (canonical_root + project-relative
+    /// `source_file`). Does not touch embeddings. Used by
+    /// `ndx recall rebuild-index`. Idempotent across v1, v2, v3 palaces.
     pub fn rebuild_bm25_index(&self) -> Result<u64> {
         // Snapshot drawer texts first (read-only) so the rebuild write
         // txn does not race with concurrent inserts.
@@ -1937,6 +2029,106 @@ impl Palace {
             txn.commit()?;
         }
 
+        // ── v3 migration ──
+        // (a) Stamp canonical_root if missing. The palace's `project_root`
+        //     is the absolute path passed to `open_for_migration` — for a
+        //     direct (non-symlinked) palace this is the canonical root.
+        // (b) Rewrite every drawer's `source_file` against canonical_root.
+        //     Paths that were already inside the root become project-
+        //     relative; paths outside are left absolute; already-relative
+        //     paths pass through. Drawers with no source_file skip.
+        // (c) Stamp schema_version = v3 at the end so strict opens succeed.
+        //
+        // Each leg is idempotent: re-running on a v3 palace makes no
+        // changes beyond re-touching the schema_version entry.
+        let canonical_root: PathBuf = {
+            let txn = self.db.begin_write()?;
+            let existing: Option<PathBuf> = read_canonical_root(&txn)?;
+            let root = match existing {
+                Some(r) => r,
+                None => {
+                    let abs = absolute_path(&self.project_root);
+                    let s = abs
+                        .to_str()
+                        .context("canonical_root must be valid UTF-8")?
+                        .to_string();
+                    let mut meta = txn.open_table(META)?;
+                    meta.insert("canonical_root", s.as_bytes())?;
+                    PathBuf::from(s)
+                }
+            };
+            txn.commit()?;
+            root
+        };
+
+        // Rewrite source_file entries in drawers + rebuild FILE_DRAWER_XREF
+        // under the normalized form. Done in a single pass so the xref
+        // table stays consistent with the DRAWERS rows.
+        {
+            let rtxn = self.db.begin_read()?;
+            let drawers_tbl = rtxn.open_table(DRAWERS)?;
+            let updates: Vec<(u64, Drawer, Option<String>, Option<String>)> = {
+                let mut out = Vec::new();
+                for entry in drawers_tbl.iter()? {
+                    let (k, v) = entry?;
+                    let id = k.value();
+                    let mut d: Drawer = serde_json::from_slice(v.value())?;
+                    let old = d.source_file.clone();
+                    if let Some(ref sf) = d.source_file {
+                        let normalized = normalize_source_file(
+                            &canonical_root,
+                            Path::new(sf),
+                        );
+                        let norm_str = normalized.to_string_lossy().into_owned();
+                        if Some(&norm_str) != old.as_ref() {
+                            d.source_file = Some(norm_str);
+                        }
+                    }
+                    let new = d.source_file.clone();
+                    if old != new {
+                        out.push((id, d, old, new));
+                    }
+                }
+                out
+            };
+            drop(drawers_tbl);
+            drop(rtxn);
+
+            if !updates.is_empty() {
+                for chunk in updates.chunks(MINE_BATCH_SIZE) {
+                    let txn = self.db.begin_write()?;
+                    {
+                        let mut drawers_w = txn.open_table(DRAWERS)?;
+                        for (id, d, _, _) in chunk {
+                            let bytes = serde_json::to_vec(d)?;
+                            drawers_w.insert(*id, bytes.as_slice())?;
+                        }
+                    }
+                    // Keep FILE_DRAWER_XREF consistent: remove the id from
+                    // its old key, re-insert under the new key.
+                    for (id, _, old, new) in chunk {
+                        if let Some(old_key) = old {
+                            remove_from_string_index(
+                                &txn,
+                                FILE_DRAWER_XREF,
+                                old_key,
+                                *id,
+                            )?;
+                        }
+                        if let Some(new_key) = new {
+                            add_to_string_index(
+                                &txn,
+                                FILE_DRAWER_XREF,
+                                new_key,
+                                *id,
+                            )?;
+                        }
+                    }
+                    txn.commit()?;
+                }
+            }
+        }
+
         // Stamp current schema version so subsequent opens via the strict
         // path succeed. Safe to run on an already-current palace too.
         {
@@ -1952,6 +2144,92 @@ impl Palace {
         }
 
         Ok(count)
+    }
+
+    /// MVCC-backed point-in-time copy of the palace to `target_path`
+    /// (R-1052). Opens a read txn on `self`, creates a fresh redb at
+    /// the target, and walks every schema table under the read
+    /// snapshot, inserting each entry into a single write txn on the
+    /// target. Concurrent writers on `self` do not block and cannot
+    /// corrupt the copy.
+    ///
+    /// The target path must not already exist. Callers should pass a
+    /// staging path (e.g. `.ndx/recall.redb.new`) and atomically rename
+    /// on success.
+    pub fn mvcc_copy_to(&self, target_path: &Path) -> Result<()> {
+        if target_path.exists() {
+            anyhow::bail!(
+                "mvcc_copy_to: target {} already exists",
+                target_path.display()
+            );
+        }
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating {}", parent.display())
+            })?;
+        }
+
+        let target_db = Database::create(target_path)
+            .with_context(|| format!("creating {}", target_path.display()))?;
+
+        // Preopen every table on the target so the write txn has a pinned
+        // schema, matching the layout in `open_or_create`.
+        {
+            let txn = target_db.begin_write()?;
+            txn.open_table(DRAWERS)?;
+            txn.open_table(DRAWER_BY_HASH)?;
+            txn.open_table(DRAWER_EMBEDDINGS)?;
+            txn.open_table(DRAWERS_BY_ROOM)?;
+            txn.open_table(ROOMS)?;
+            txn.open_table(BM25_POSTINGS)?;
+            txn.open_table(DRAWERS_BY_TOKEN)?;
+            txn.open_table(DRAWER_LENGTHS)?;
+            txn.open_table(BM25_META)?;
+            txn.open_table(LINKS)?;
+            txn.open_table(FILE_DRAWER_XREF)?;
+            txn.open_table(SESSION_DRAWER_XREF)?;
+            txn.open_table(COMMIT_DRAWER_XREF)?;
+            txn.open_table(WAKE_INJECTED)?;
+            txn.open_table(MINED_SESSIONS)?;
+            txn.open_table(META)?;
+            txn.commit()?;
+        }
+
+        let rtxn = self.db.begin_read()?;
+        let wtxn = target_db.begin_write()?;
+
+        // ── string-keyed u64 tables ──
+        copy_table_str_u64(&rtxn, &wtxn, WAKE_INJECTED)?;
+        copy_table_str_u64(&rtxn, &wtxn, MINED_SESSIONS)?;
+
+        // ── u64-keyed bytes tables ──
+        copy_table_u64_bytes(&rtxn, &wtxn, DRAWERS)?;
+        copy_table_u64_bytes(&rtxn, &wtxn, DRAWER_EMBEDDINGS)?;
+        copy_table_u64_bytes(&rtxn, &wtxn, DRAWERS_BY_TOKEN)?;
+
+        // ── u64-keyed u32 table ──
+        copy_table_u64_u32(&rtxn, &wtxn, DRAWER_LENGTHS)?;
+
+        // ── bytes-keyed u64 (hash binding) ──
+        copy_table_bytes_u64(&rtxn, &wtxn, DRAWER_BY_HASH)?;
+
+        // ── bytes-keyed bytes (links) ──
+        copy_table_bytes_bytes(&rtxn, &wtxn, LINKS)?;
+
+        // ── string-keyed bytes tables ──
+        copy_table_str_bytes(&rtxn, &wtxn, DRAWERS_BY_ROOM)?;
+        copy_table_str_bytes(&rtxn, &wtxn, ROOMS)?;
+        copy_table_str_bytes(&rtxn, &wtxn, BM25_POSTINGS)?;
+        copy_table_str_bytes(&rtxn, &wtxn, BM25_META)?;
+        copy_table_str_bytes(&rtxn, &wtxn, FILE_DRAWER_XREF)?;
+        copy_table_str_bytes(&rtxn, &wtxn, SESSION_DRAWER_XREF)?;
+        copy_table_str_bytes(&rtxn, &wtxn, COMMIT_DRAWER_XREF)?;
+        copy_table_str_bytes(&rtxn, &wtxn, META)?;
+
+        wtxn.commit()?;
+        drop(rtxn);
+        drop(target_db);
+        Ok(())
     }
 
     /// Reembed all drawers currently missing an embedding row (or all of
@@ -2117,6 +2395,111 @@ fn remove_from_string_index(
         t.insert(key, encode_u64_list(&ids).as_slice())?;
     }
     Ok(())
+}
+
+// ── MVCC copy helpers (R-1052) ──
+//
+// Each helper walks a table under a read txn and inserts every entry
+// into the matching table on the target write txn. Keys and values are
+// copied verbatim — no translation, no schema change. The helpers are
+// split by table key/value type because redb's `TableDefinition` is a
+// phantom-typed handle, and these are the exact type tuples used by the
+// palace schema.
+
+fn copy_table_str_bytes(
+    rtxn: &redb::ReadTransaction,
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<&'static str, &'static [u8]>,
+) -> Result<()> {
+    let src = rtxn.open_table(def)?;
+    let mut dst = wtxn.open_table(def)?;
+    for entry in src.iter()? {
+        let (k, v) = entry?;
+        dst.insert(k.value(), v.value())?;
+    }
+    Ok(())
+}
+
+fn copy_table_str_u64(
+    rtxn: &redb::ReadTransaction,
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<&'static str, u64>,
+) -> Result<()> {
+    let src = rtxn.open_table(def)?;
+    let mut dst = wtxn.open_table(def)?;
+    for entry in src.iter()? {
+        let (k, v) = entry?;
+        dst.insert(k.value(), v.value())?;
+    }
+    Ok(())
+}
+
+fn copy_table_u64_bytes(
+    rtxn: &redb::ReadTransaction,
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<u64, &'static [u8]>,
+) -> Result<()> {
+    let src = rtxn.open_table(def)?;
+    let mut dst = wtxn.open_table(def)?;
+    for entry in src.iter()? {
+        let (k, v) = entry?;
+        dst.insert(k.value(), v.value())?;
+    }
+    Ok(())
+}
+
+fn copy_table_u64_u32(
+    rtxn: &redb::ReadTransaction,
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<u64, u32>,
+) -> Result<()> {
+    let src = rtxn.open_table(def)?;
+    let mut dst = wtxn.open_table(def)?;
+    for entry in src.iter()? {
+        let (k, v) = entry?;
+        dst.insert(k.value(), v.value())?;
+    }
+    Ok(())
+}
+
+fn copy_table_bytes_u64(
+    rtxn: &redb::ReadTransaction,
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<&'static [u8], u64>,
+) -> Result<()> {
+    let src = rtxn.open_table(def)?;
+    let mut dst = wtxn.open_table(def)?;
+    for entry in src.iter()? {
+        let (k, v) = entry?;
+        dst.insert(k.value(), v.value())?;
+    }
+    Ok(())
+}
+
+fn copy_table_bytes_bytes(
+    rtxn: &redb::ReadTransaction,
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<&'static [u8], &'static [u8]>,
+) -> Result<()> {
+    let src = rtxn.open_table(def)?;
+    let mut dst = wtxn.open_table(def)?;
+    for entry in src.iter()? {
+        let (k, v) = entry?;
+        dst.insert(k.value(), v.value())?;
+    }
+    Ok(())
+}
+
+/// Read the `canonical_root` META entry from inside an open write txn.
+/// Returns `None` on pre-v3 palaces (the field is absent until
+/// `rebuild-index` stamps it).
+fn read_canonical_root(txn: &redb::WriteTransaction) -> Result<Option<PathBuf>> {
+    let meta = txn.open_table(META)?;
+    let out = meta
+        .get("canonical_root")?
+        .and_then(|v| String::from_utf8(v.value().to_vec()).ok())
+        .map(PathBuf::from);
+    Ok(out)
 }
 
 fn hex_decode_32(hex: &str) -> Result<[u8; 32]> {
@@ -2376,6 +2759,95 @@ pub fn validate_room_name(name: &str) -> Result<()> {
 pub fn current_project_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     Ok(cwd.canonicalize().unwrap_or(cwd))
+}
+
+/// Best-effort absolute path. Uses `canonicalize` when the path exists,
+/// otherwise joins CWD for relative inputs and leaves absolutes alone.
+/// Never fails — falls back to the input on error paths.
+pub fn absolute_path(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+/// Return the resolved absolute target of `path` as a string, iff
+/// `path` is itself a symlink (or becomes one after reading). Returns
+/// `None` when `path` is a regular file, missing, or its metadata is
+/// inaccessible. Uses `symlink_metadata` so the call never follows the
+/// link (that would defeat the check).
+pub fn symlink_resolved_target(path: &Path) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            // Resolve to an absolute target. First try `canonicalize`
+            // (follows the chain). If it fails (broken link), fall back
+            // to `read_link` joined with the parent directory so status
+            // still has a useful value.
+            if let Ok(target) = std::fs::canonicalize(path) {
+                return Some(target.to_string_lossy().into_owned());
+            }
+            if let Ok(link) = std::fs::read_link(path) {
+                let resolved = if link.is_absolute() {
+                    link
+                } else {
+                    path.parent().unwrap_or(Path::new("")).join(link)
+                };
+                return Some(resolved.to_string_lossy().into_owned());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a user-supplied path for xref lookup against stored
+/// canonical-relative `source_file` values (R-1023).
+///
+/// Returns the input as a [`PathBuf`] with the canonical_root prefix
+/// stripped when applicable. Input is treated as:
+///   * absolute → strip canonical_root prefix if present, else keep
+///   * relative → try `canonicalize` (cwd-relative), strip prefix;
+///     otherwise keep as-is
+pub fn resolve_query_path(canonical_root: Option<&Path>, input: &str) -> PathBuf {
+    let p = Path::new(input);
+    let abs = absolute_path(p);
+    match canonical_root {
+        Some(root) => normalize_source_file(root, &abs),
+        None => {
+            if p.is_absolute() {
+                abs
+            } else {
+                p.to_path_buf()
+            }
+        }
+    }
+}
+
+/// Normalize a drawer `source_file` for storage per R-1021:
+///
+/// - If `input` is absolute and lives inside `canonical_root`, return the
+///   canonical-relative portion (forward-slash normalized).
+/// - If `input` is relative, return it verbatim — callers are expected
+///   to pass canonical-relative paths in that case.
+/// - If `input` is absolute but outside `canonical_root`, return it
+///   unchanged (absolute paths outside the project are preserved).
+///
+/// The function performs no I/O; both arguments are compared as-is.
+pub fn normalize_source_file(canonical_root: &Path, input: &Path) -> PathBuf {
+    if !input.is_absolute() {
+        return input.to_path_buf();
+    }
+    match input.strip_prefix(canonical_root) {
+        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => input.to_path_buf(),
+    }
 }
 
 /// Short human-readable name of a project (directory basename).
@@ -2929,17 +3401,20 @@ mod tests {
     #[test]
     fn open_for_migration_bumps_stale_schema_version() {
         let dir = tmp_project();
-        let root = dir.path().to_path_buf();
+        let root = dir.path().canonicalize().unwrap();
         {
             let p = Palace::create_at(root.clone()).unwrap();
             p.insert_drawer_no_embedding(mk_drawer("alpha beta"))
                 .unwrap();
-            // Simulate a v1 palace by rewriting the stored schema_version.
+            // Simulate a v1 palace by rewriting the stored schema_version
+            // AND dropping canonical_root so rebuild-index has to stamp
+            // it on the way back up to v3 (covers both migration legs).
             let txn = p.db.begin_write().unwrap();
             {
                 let mut meta = txn.open_table(META).unwrap();
                 meta.insert("schema_version", 1u32.to_le_bytes().as_slice())
                     .unwrap();
+                meta.remove("canonical_root").unwrap();
             }
             txn.commit().unwrap();
         }
@@ -2951,14 +3426,388 @@ mod tests {
         };
         assert!(err.to_string().contains("rebuild-index"), "{}", err);
 
-        // Migration open + rebuild stamps the current version.
+        // Migration open + rebuild stamps the current version AND
+        // canonical_root (v1→v3 in one call).
         let p = Palace::open_for_migration(root.clone()).unwrap();
         p.rebuild_bm25_index().unwrap();
         drop(p);
 
-        // Subsequent strict open succeeds.
-        let p = Palace::open_at(root).unwrap();
+        // Subsequent strict open succeeds with canonical_root populated.
+        let p = Palace::open_at(root.clone()).unwrap();
         assert_eq!(p.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let stamped = p.canonical_root().unwrap().expect("canonical_root stamped");
+        assert_eq!(stamped, root);
+    }
+
+    // ── v0.8.0 / Shared Palaces (§19) ──
+
+    #[test]
+    fn normalize_source_file_paths() {
+        use std::path::PathBuf;
+        let root = PathBuf::from("/workspace/proj");
+        // Absolute inside canonical_root → stripped.
+        assert_eq!(
+            normalize_source_file(&root, &PathBuf::from("/workspace/proj/src/a.rs")),
+            PathBuf::from("src/a.rs")
+        );
+        // Nested path.
+        assert_eq!(
+            normalize_source_file(&root, &PathBuf::from("/workspace/proj/docs/specs/recall.md")),
+            PathBuf::from("docs/specs/recall.md")
+        );
+        // Equal to canonical_root (strip_prefix yields empty) → ".".
+        assert_eq!(
+            normalize_source_file(&root, &PathBuf::from("/workspace/proj")),
+            PathBuf::from(".")
+        );
+        // Absolute outside canonical_root → left absolute.
+        assert_eq!(
+            normalize_source_file(&root, &PathBuf::from("/etc/hosts")),
+            PathBuf::from("/etc/hosts")
+        );
+        // Relative input passes through verbatim.
+        assert_eq!(
+            normalize_source_file(&root, &PathBuf::from("src/a.rs")),
+            PathBuf::from("src/a.rs")
+        );
+        // Trailing-slash variant on canonical_root still works via
+        // strip_prefix semantics (PathBuf compares components, not bytes).
+        let root_slash = PathBuf::from("/workspace/proj/");
+        assert_eq!(
+            normalize_source_file(&root_slash, &PathBuf::from("/workspace/proj/src/a.rs")),
+            PathBuf::from("src/a.rs")
+        );
+    }
+
+    #[test]
+    fn rebuild_index_v2_to_v3_stamps_canonical_root() {
+        let dir = tmp_project();
+        let root = dir.path().canonicalize().unwrap();
+
+        // Create a palace, insert drawers with absolute source_file paths
+        // that point inside the root. Then simulate a v2 palace by
+        // removing canonical_root from META and bumping schema_version
+        // back to 2.
+        let abs_file = root.join("src").join("a.rs").to_string_lossy().into_owned();
+        {
+            let p = Palace::create_at(root.clone()).unwrap();
+            // Before we stage a v2 state, wipe canonical_root so
+            // insert_drawer does NOT pre-normalize the path.
+            let txn = p.db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(META).unwrap();
+                meta.remove("canonical_root").unwrap();
+                meta.insert("schema_version", 2u32.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+
+            let mut d = mk_drawer("contents of a");
+            d.source_file = Some(abs_file.clone());
+            p.insert_drawer_no_embedding(d).unwrap();
+
+            // A second drawer with a path OUTSIDE the root — rebuild
+            // must leave it absolute.
+            let mut d2 = mk_drawer("outside note");
+            d2.source_file = Some("/etc/somefile".to_string());
+            p.insert_drawer_no_embedding(d2).unwrap();
+
+            // A third drawer with no source_file — must pass through.
+            p.insert_drawer_no_embedding(mk_drawer("no source")).unwrap();
+        }
+
+        // v2 → strict open refuses with a pointer to rebuild-index.
+        let err = match Palace::open_at(root.clone()) {
+            Ok(_) => panic!("open_at should reject v2 palace"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("rebuild-index"), "{}", err);
+
+        // Migration open + rebuild does the v2→v3 work in one call.
+        let p = Palace::open_for_migration(root.clone()).unwrap();
+        p.rebuild_bm25_index().unwrap();
+        drop(p);
+
+        let p = Palace::open_at(root.clone()).unwrap();
+        let stats = p.stats().unwrap();
+        assert_eq!(stats.schema_version, SCHEMA_VERSION);
+        assert_eq!(stats.canonical_root.as_deref(), root.to_str());
+
+        // Verify source_file was rewritten:
+        //   - absolute-inside → project-relative
+        //   - absolute-outside → unchanged
+        //   - None → unchanged
+        let all = p.list_drawers(None, 100, 0).unwrap();
+        let by_text: std::collections::HashMap<String, Option<String>> = all
+            .iter()
+            .map(|d| (d.text.clone(), d.source_file.clone()))
+            .collect();
+        assert_eq!(
+            by_text.get("contents of a").unwrap().as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            by_text.get("outside note").unwrap().as_deref(),
+            Some("/etc/somefile")
+        );
+        assert!(by_text.get("no source").unwrap().is_none());
+
+        // FILE_DRAWER_XREF rebuilt on the canonical form.
+        let hits = p.drawers_for_file("src/a.rs").unwrap();
+        assert!(hits.iter().any(|d| d.text == "contents of a"));
+    }
+
+    #[test]
+    fn rebuild_index_is_idempotent_on_v3() {
+        let dir = tmp_project();
+        let root = dir.path().canonicalize().unwrap();
+        let p = Palace::create_at(root.clone()).unwrap();
+        let mut d = mk_drawer("x");
+        d.source_file = Some(root.join("a.txt").to_string_lossy().into_owned());
+        p.insert_drawer_no_embedding(d).unwrap();
+        drop(p);
+
+        let p = Palace::open_for_migration(root.clone()).unwrap();
+        p.rebuild_bm25_index().unwrap();
+        let first_root = p.canonical_root().unwrap();
+        let first_drawer = p.list_drawers(None, 10, 0).unwrap()[0].clone();
+        drop(p);
+
+        // Second run makes no observable change.
+        let p = Palace::open_for_migration(root.clone()).unwrap();
+        p.rebuild_bm25_index().unwrap();
+        assert_eq!(p.canonical_root().unwrap(), first_root);
+        let second_drawer = p.list_drawers(None, 10, 0).unwrap()[0].clone();
+        assert_eq!(first_drawer.source_file, second_drawer.source_file);
+        assert_eq!(p.stats().unwrap().schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn link_palace_rejects_non_empty_without_force() {
+        use crate::{cmd_recall_link_palace_at, cmd_recall_unlink_palace_at};
+        let canonical_dir = tmp_project();
+        let canonical = canonical_dir.path().canonicalize().unwrap();
+        let secondary_dir = tmp_project();
+        let secondary = secondary_dir.path().canonicalize().unwrap();
+
+        // Canonical has drawers.
+        let p_can = Palace::create_at(canonical.clone()).unwrap();
+        p_can.insert_drawer_no_embedding(mk_drawer("canonical note"))
+            .unwrap();
+        drop(p_can);
+
+        // Secondary also has drawers.
+        let p_sec = Palace::create_at(secondary.clone()).unwrap();
+        p_sec.insert_drawer_no_embedding(mk_drawer("secondary note"))
+            .unwrap();
+        drop(p_sec);
+
+        let canonical_arg = canonical.to_string_lossy().into_owned();
+        let args = vec![canonical_arg.clone()];
+        let err = cmd_recall_link_palace_at(&args, &secondary).unwrap_err();
+        assert!(err.to_string().contains("drawers"), "{}", err);
+
+        // --force succeeds, creating the symlink.
+        let args = vec![canonical_arg.clone(), "--force".into()];
+        cmd_recall_link_palace_at(&args, &secondary).unwrap();
+        let local = secondary.join(".ndx").join("recall.redb");
+        let meta = std::fs::symlink_metadata(&local).unwrap();
+        assert!(meta.file_type().is_symlink());
+
+        // Opening the secondary now sees the canonical's drawer.
+        let p = Palace::open_at(secondary.clone()).unwrap();
+        assert_eq!(p.stats().unwrap().drawer_count, 1);
+        drop(p);
+
+        // unlink-palace removes the symlink.
+        cmd_recall_unlink_palace_at(&[], &secondary).unwrap();
+        assert!(!local.exists());
+    }
+
+    #[test]
+    fn link_palace_refuses_missing_target() {
+        use crate::cmd_recall_link_palace_at;
+        let secondary_dir = tmp_project();
+        let secondary = secondary_dir.path().canonicalize().unwrap();
+        let bogus = secondary.join("does-not-exist");
+        let args = vec![bogus.to_string_lossy().into_owned()];
+        let err = cmd_recall_link_palace_at(&args, &secondary).unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn link_palace_resolves_symlink_chain() {
+        use crate::cmd_recall_link_palace_at;
+        let a_dir = tmp_project();
+        let a = a_dir.path().canonicalize().unwrap();
+        let b_dir = tmp_project();
+        let b = b_dir.path().canonicalize().unwrap();
+        let c_dir = tmp_project();
+        let c = c_dir.path().canonicalize().unwrap();
+
+        // A is canonical with a drawer.
+        let p = Palace::create_at(a.clone()).unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("a note")).unwrap();
+        drop(p);
+
+        // B → A.
+        cmd_recall_link_palace_at(&[a.to_string_lossy().into_owned()], &b).unwrap();
+
+        // C → B should collapse to C → A (R-1043).
+        cmd_recall_link_palace_at(&[b.to_string_lossy().into_owned()], &c).unwrap();
+
+        let c_symlink = c.join(".ndx").join("recall.redb");
+        let c_target = std::fs::read_link(&c_symlink).unwrap();
+        let a_db = a.join(".ndx").join("recall.redb");
+        assert_eq!(c_target, a_db, "C must link directly to A, not via B");
+    }
+
+    #[test]
+    fn unlink_palace_keep_mvcc_copy() {
+        use crate::{cmd_recall_link_palace_at, cmd_recall_unlink_palace_at};
+        let canonical_dir = tmp_project();
+        let canonical = canonical_dir.path().canonicalize().unwrap();
+        let secondary_dir = tmp_project();
+        let secondary = secondary_dir.path().canonicalize().unwrap();
+
+        // Canonical starts with one drawer.
+        let p_can = Palace::create_at(canonical.clone()).unwrap();
+        p_can.insert_drawer_no_embedding(mk_drawer("canonical drawer"))
+            .unwrap();
+        drop(p_can);
+
+        // Link secondary.
+        cmd_recall_link_palace_at(
+            &[canonical.to_string_lossy().into_owned()],
+            &secondary,
+        )
+        .unwrap();
+
+        // Insert another drawer via the symlinked palace — it should
+        // land in the canonical redb.
+        let p = Palace::open_at(secondary.clone()).unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("via-secondary drawer"))
+            .unwrap();
+        drop(p);
+
+        // unlink-palace --keep → MVCC copy replaces the symlink.
+        cmd_recall_unlink_palace_at(&["--keep".to_string()], &secondary).unwrap();
+
+        let local = secondary.join(".ndx").join("recall.redb");
+        let meta = std::fs::symlink_metadata(&local).unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "after --keep, local palace must be a regular file"
+        );
+
+        // The copy has every drawer.
+        let p = Palace::open_at(secondary.clone()).unwrap();
+        assert_eq!(p.stats().unwrap().drawer_count, 2);
+        let texts: std::collections::HashSet<String> = p
+            .list_drawers(None, 100, 0)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.text)
+            .collect();
+        assert!(texts.contains("canonical drawer"));
+        assert!(texts.contains("via-secondary drawer"));
+    }
+
+    #[test]
+    fn status_includes_canonical_root_and_linked_to() {
+        use crate::cmd_recall_link_palace_at;
+        let canonical_dir = tmp_project();
+        let canonical = canonical_dir.path().canonicalize().unwrap();
+        let secondary_dir = tmp_project();
+        let secondary = secondary_dir.path().canonicalize().unwrap();
+
+        // Canonical palace: stats.canonical_root set, linked_to None.
+        let p_can = Palace::create_at(canonical.clone()).unwrap();
+        let stats = p_can.stats().unwrap();
+        assert_eq!(stats.canonical_root.as_deref(), canonical.to_str());
+        assert!(stats.palace_linked_to.is_none());
+        drop(p_can);
+
+        // Link B → A.
+        cmd_recall_link_palace_at(
+            &[canonical.to_string_lossy().into_owned()],
+            &secondary,
+        )
+        .unwrap();
+
+        let p_sec = Palace::open_at(secondary.clone()).unwrap();
+        let stats = p_sec.stats().unwrap();
+        // canonical_root is inherited from the linked target.
+        assert_eq!(stats.canonical_root.as_deref(), canonical.to_str());
+        // palace_linked_to is populated because the local redb is a symlink.
+        let linked = stats
+            .palace_linked_to
+            .expect("linked_to populated when palace file is a symlink");
+        let canonical_db = canonical.join(".ndx").join("recall.redb");
+        let canonical_db_canon = canonical_db.canonicalize().unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(&linked).canonicalize().unwrap(),
+            canonical_db_canon
+        );
+    }
+
+    #[test]
+    fn rehome_rewrites_canonical_root() {
+        let dir = tmp_project();
+        let root = dir.path().canonicalize().unwrap();
+        let p = Palace::create_at(root.clone()).unwrap();
+        let original = p.canonical_root().unwrap().unwrap();
+        assert_eq!(original, root);
+
+        let new_root = std::path::PathBuf::from("/tmp/relocated-canonical");
+        p.set_canonical_root(&new_root).unwrap();
+
+        let after = p.canonical_root().unwrap().unwrap();
+        // absolute_path is best-effort; on a nonexistent path it returns
+        // the input (absolute case).
+        assert_eq!(after, new_root);
+        // `rehome` must not re-normalize source_file entries — we're
+        // asserting no drawers got mutated (there are none; just verify
+        // schema_version is untouched).
+        assert_eq!(p.stats().unwrap().schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn xref_drawer_canonical_absolute_input() {
+        let dir = tmp_project();
+        let root = dir.path().canonicalize().unwrap();
+        let p = Palace::create_at(root.clone()).unwrap();
+
+        // Insert via absolute path — normalization at insert stores it
+        // canonically-relative.
+        let abs = root.join("src").join("main.rs").to_string_lossy().into_owned();
+        let mut d = mk_drawer("main.rs content line");
+        d.source_file = Some(abs.clone());
+        p.insert_drawer_no_embedding(d).unwrap();
+
+        // Verify stored form is project-relative.
+        let stored = p.list_drawers(None, 10, 0).unwrap()[0]
+            .source_file
+            .clone()
+            .unwrap();
+        assert_eq!(stored, "src/main.rs");
+
+        // Lookup by absolute path must hit (R-1023).
+        let hits = p.drawers_for_file(&abs).unwrap();
+        assert!(
+            hits.iter().any(|d| d.source_file.as_deref() == Some("src/main.rs")),
+            "absolute input must resolve via canonical_root"
+        );
+
+        // Lookup by project-relative path also hits.
+        let hits_rel = p.drawers_for_file("src/main.rs").unwrap();
+        assert!(hits_rel
+            .iter()
+            .any(|d| d.source_file.as_deref() == Some("src/main.rs")));
     }
 
     #[test]
