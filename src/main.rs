@@ -313,6 +313,8 @@ fn cmd_xref_drawer(args: &[String]) -> Result<()> {
         .ok_or_else(|| RecallError::usage("usage: ndx xref drawer <file>"))?;
     let palace = Palace::open_from_cwd()?;
     let limit = get_flag_usize(args, "--limit").unwrap_or(20);
+    // R-1023: `drawers_for_file` now resolves its input against
+    // canonical_root internally — pass the raw path straight through.
     let mut hits = palace.drawers_for_file(path)?;
     hits.truncate(limit);
     render_drawer_hits(&hits, args.iter().any(|a| a == "--json"))
@@ -661,7 +663,7 @@ fn cmd_recall(args: &[String]) -> Result<()> {
     let sub = args.first().map(|s| s.as_str());
     let sub_args: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
     match sub {
-        Some("init") => cmd_recall_init(),
+        Some("init") => cmd_recall_init(sub_args),
         Some("status") => cmd_recall_status(sub_args),
         Some("room") => cmd_recall_room(sub_args),
         Some("identity") => cmd_recall_identity(sub_args),
@@ -672,6 +674,9 @@ fn cmd_recall(args: &[String]) -> Result<()> {
         Some("search") => cmd_recall_search(sub_args),
         Some("reembed") => cmd_recall_reembed(sub_args),
         Some("rebuild-index") => cmd_recall_rebuild_index(sub_args),
+        Some("link-palace") => cmd_recall_link_palace(sub_args),
+        Some("unlink-palace") => cmd_recall_unlink_palace(sub_args),
+        Some("rehome") => cmd_recall_rehome(sub_args),
         Some(other) => Err(RecallError::usage(format!(
             "unknown recall subcommand `{}`. Run `ndx help` for usage.",
             other
@@ -688,7 +693,10 @@ fn print_recall_usage() {
     eprintln!("ndx recall — per-project structured episodic memory palace");
     eprintln!();
     eprintln!("Palace lifecycle:");
-    eprintln!("  ndx recall init                 Create .ndx/recall.redb in current project");
+    eprintln!("  ndx recall init [--link <canonical-root>]  Create (or link) .ndx/recall.redb");
+    eprintln!("  ndx recall link-palace <canonical-root> [--force]  Replace local palace with symlink");
+    eprintln!("  ndx recall unlink-palace [--keep]          Remove symlink (optionally keep a local copy)");
+    eprintln!("  ndx recall rehome <new-canonical-root>     Rewrite canonical_root in META");
     eprintln!("  ndx recall status [--json]      Palace statistics");
     eprintln!();
     eprintln!("Rooms:");
@@ -724,8 +732,61 @@ fn print_recall_usage() {
     eprintln!("  ndx recall identity edit [--project]");
 }
 
-fn cmd_recall_init() -> Result<()> {
+fn cmd_recall_init(args: &[String]) -> Result<()> {
+    let link = get_flag(args, "--link");
+
     let root = recall::current_project_root()?;
+
+    if let Some(target_root) = link {
+        // R-1031: `ndx recall init --link <canonical-root>` creates a
+        // symlink to the canonical palace. Refuses if the target does
+        // not yet exist (R-1044). No canonical_root is stamped locally;
+        // the target's META is authoritative.
+        let target_root = std::path::PathBuf::from(target_root);
+        let target_abs = recall::absolute_path(&target_root);
+        let target_db = target_abs.join(".ndx").join("recall.redb");
+        if !target_db.exists() {
+            return Err(RecallError::constraint(format!(
+                "target palace does not exist: {} — run `ndx recall init` there first",
+                target_db.display()
+            ))
+            .into());
+        }
+
+        let ndx_dir = root.join(".ndx");
+        std::fs::create_dir_all(&ndx_dir).with_context(|| {
+            format!("creating {}", ndx_dir.display())
+        })?;
+        let local_db = ndx_dir.join("recall.redb");
+        if local_db.exists()
+            || std::fs::symlink_metadata(&local_db).is_ok()
+        {
+            return Err(RecallError::constraint(format!(
+                "{} already exists — remove it or use `ndx recall link-palace`",
+                local_db.display()
+            ))
+            .into());
+        }
+
+        // Resolve a chain once (R-1043).
+        let final_target = resolve_one_hop_symlink(&target_db)?;
+
+        std::os::unix::fs::symlink(&final_target, &local_db).with_context(|| {
+            format!(
+                "creating symlink {} -> {}",
+                local_db.display(),
+                final_target.display()
+            )
+        })?;
+        install::ensure_gitignore_entry(&root)?;
+        eprintln!(
+            "recall palace linked: {} -> {}",
+            local_db.display(),
+            final_target.display()
+        );
+        return Ok(());
+    }
+
     let _palace = Palace::create_at(root.clone())?;
     install::ensure_gitignore_entry(&root)?;
     eprintln!(
@@ -735,12 +796,43 @@ fn cmd_recall_init() -> Result<()> {
     Ok(())
 }
 
+/// Resolve a palace path one hop (R-1043): if `path` is itself a
+/// symlink, read its target once so every linked checkout points at
+/// the canonical directly rather than forming a chain. Absolutizes the
+/// result.
+fn resolve_one_hop_symlink(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            let link = std::fs::read_link(path)
+                .with_context(|| format!("readlink {}", path.display()))?;
+            let resolved = if link.is_absolute() {
+                link
+            } else {
+                path.parent().unwrap_or(std::path::Path::new("")).join(link)
+            };
+            Ok(recall::absolute_path(&resolved))
+        }
+        _ => Ok(recall::absolute_path(path)),
+    }
+}
+
 fn cmd_recall_status(args: &[String]) -> Result<()> {
     let palace = Palace::open_from_cwd()?;
     let stats = palace.stats()?;
     let json = args.iter().any(|a| a == "--json");
     if json {
-        println!("{}", serde_json::to_string_pretty(&stats)?);
+        // R-1072: JSON surface always includes both fields. Serialize via
+        // serde_json::Value so `palace_linked_to` renders as `null` when
+        // the palace is not a symlink (the default `serde(default)`
+        // behaviour already ensures the key is present).
+        let mut v = serde_json::to_value(&stats)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.entry("canonical_root")
+                .or_insert(serde_json::Value::Null);
+            obj.entry("palace_linked_to")
+                .or_insert(serde_json::Value::Null);
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
     println!("Recall palace: {}", palace.db_path().display());
@@ -758,6 +850,14 @@ fn cmd_recall_status(args: &[String]) -> Result<()> {
     }
     if let Some(ts) = stats.created_at {
         println!("  Created: {}", format_unix(ts));
+    }
+    // R-1071: canonical_root always if set; linked target only when
+    // the local palace file is a symlink.
+    if let Some(root) = &stats.canonical_root {
+        println!("  Canonical root: {}", root);
+    }
+    if let Some(linked) = &stats.palace_linked_to {
+        println!("  Linked to: {}", linked);
     }
     Ok(())
 }
@@ -1450,6 +1550,133 @@ fn cmd_recall_reembed(args: &[String]) -> Result<()> {
     let force = args.iter().any(|a| a == "--force");
     let count = palace.reembed_all(force)?;
     eprintln!("reembedded {} drawers", count);
+    Ok(())
+}
+
+fn cmd_recall_link_palace(args: &[String]) -> Result<()> {
+    cmd_recall_link_palace_at(args, &recall::current_project_root()?)
+}
+
+/// Extracted so tests can exercise the command against a temp dir
+/// without depending on CWD.
+fn cmd_recall_link_palace_at(args: &[String], cwd: &std::path::Path) -> Result<()> {
+    let target_root = get_positional(args, &[])
+        .ok_or_else(|| RecallError::usage("usage: ndx recall link-palace <canonical-root> [--force]"))?;
+    let force = args.iter().any(|a| a == "--force");
+
+    let target_abs = recall::absolute_path(std::path::Path::new(target_root));
+    let target_db = target_abs.join(".ndx").join("recall.redb");
+    if !target_db.exists() {
+        // R-1041: refuse if the target palace does not exist.
+        return Err(RecallError::constraint(format!(
+            "target palace does not exist: {}",
+            target_db.display()
+        ))
+        .into());
+    }
+
+    let ndx_dir = cwd.join(".ndx");
+    std::fs::create_dir_all(&ndx_dir).with_context(|| {
+        format!("creating {}", ndx_dir.display())
+    })?;
+    let local_db = ndx_dir.join("recall.redb");
+
+    // R-1042: refuse if the local palace has drawers, unless --force.
+    let local_is_symlink = std::fs::symlink_metadata(&local_db)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if local_db.exists() && !local_is_symlink {
+        let palace = Palace::open_at(cwd.to_path_buf())?;
+        let stats = palace.stats()?;
+        drop(palace);
+        if stats.drawer_count > 0 && !force {
+            return Err(RecallError::constraint(format!(
+                "refusing to replace palace with {} drawers; pass --force to overwrite",
+                stats.drawer_count
+            ))
+            .into());
+        }
+        std::fs::remove_file(&local_db).with_context(|| {
+            format!("removing {}", local_db.display())
+        })?;
+    } else if local_is_symlink {
+        std::fs::remove_file(&local_db).with_context(|| {
+            format!("removing symlink {}", local_db.display())
+        })?;
+    }
+
+    let final_target = resolve_one_hop_symlink(&target_db)?;
+    std::os::unix::fs::symlink(&final_target, &local_db).with_context(|| {
+        format!(
+            "creating symlink {} -> {}",
+            local_db.display(),
+            final_target.display()
+        )
+    })?;
+    install::ensure_gitignore_entry(cwd)?;
+    eprintln!(
+        "recall palace linked: {} -> {}",
+        local_db.display(),
+        final_target.display()
+    );
+    Ok(())
+}
+
+fn cmd_recall_unlink_palace(args: &[String]) -> Result<()> {
+    cmd_recall_unlink_palace_at(args, &recall::current_project_root()?)
+}
+
+fn cmd_recall_unlink_palace_at(args: &[String], cwd: &std::path::Path) -> Result<()> {
+    let keep = args.iter().any(|a| a == "--keep");
+    let local_db = cwd.join(".ndx").join("recall.redb");
+    let meta = std::fs::symlink_metadata(&local_db)
+        .map_err(|e| RecallError::constraint(format!(
+            "cannot stat {}: {}", local_db.display(), e
+        )))?;
+    if !meta.file_type().is_symlink() {
+        return Err(RecallError::constraint(format!(
+            "{} is not a symlink — nothing to unlink",
+            local_db.display()
+        ))
+        .into());
+    }
+
+    if keep {
+        // R-1052: MVCC read-txn copy of the canonical palace into a
+        // staging file, then atomic rename.
+        let palace = Palace::open_at(cwd.to_path_buf())?;
+        let staging = cwd.join(".ndx").join("recall.redb.new");
+        if staging.exists() {
+            std::fs::remove_file(&staging).ok();
+        }
+        palace.mvcc_copy_to(&staging)?;
+        drop(palace);
+        std::fs::remove_file(&local_db).with_context(|| {
+            format!("removing symlink {}", local_db.display())
+        })?;
+        std::fs::rename(&staging, &local_db).with_context(|| {
+            format!("renaming {} -> {}", staging.display(), local_db.display())
+        })?;
+        eprintln!(
+            "palace unlinked and copied locally: {}",
+            local_db.display()
+        );
+    } else {
+        std::fs::remove_file(&local_db).with_context(|| {
+            format!("removing symlink {}", local_db.display())
+        })?;
+        eprintln!("palace symlink removed: {}", local_db.display());
+    }
+    Ok(())
+}
+
+fn cmd_recall_rehome(args: &[String]) -> Result<()> {
+    let new_root = get_positional(args, &[])
+        .ok_or_else(|| RecallError::usage("usage: ndx recall rehome <new-canonical-root>"))?;
+    let new_abs = recall::absolute_path(std::path::Path::new(new_root));
+    let palace = Palace::open_from_cwd()?;
+    palace.set_canonical_root(&new_abs)?;
+    eprintln!("canonical_root rewritten to {}", new_abs.display());
     Ok(())
 }
 
