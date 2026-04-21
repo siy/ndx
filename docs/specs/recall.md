@@ -769,6 +769,135 @@ answered questions get moved to the amendment log.)*
 
 ---
 
+## 19. Shared Palaces
+
+Added in v0.8.0. Lets multiple checkouts of the same repository share
+one recall palace while keeping their file-index daemons and files
+local.
+
+### 19.1 Motivation (R-1000)
+
+- **R-1001** — The file index (`index.redb`) MUST remain per-checkout;
+  each checkout's files can differ.
+- **R-1002** — The recall palace (`recall.redb`) represents project
+  knowledge, not filesystem state. Two checkouts of the same repository
+  (e.g. main worktree + spike clone) SHOULD be able to share one palace
+  without duplicating storage, embedding cost, or mining effort.
+- **R-1003** — Sharing MUST be explicit (opt-in). No auto-detection of
+  "same repo, different checkout".
+
+### 19.2 Canonical Root (R-1010)
+
+- **R-1011** — A palace has a single `canonical_root: PathBuf` stored
+  in `META` at init time. It is the absolute path of the project root
+  at which the palace was originally created.
+- **R-1012** — `canonical_root` is used to interpret project-relative
+  `source_file` fields (§5.1) when a command runs from a checkout
+  whose own root differs from the canonical.
+- **R-1013** — `canonical_root` is stamped once at `ndx recall init`
+  and is immutable thereafter except via `ndx recall rehome
+  <new-root>`, which rewrites it. `rehome` is for the rare case where
+  the canonical checkout is relocated.
+
+### 19.3 Path Normalization (R-1020)
+
+- **R-1021** — `source_file` MUST be stored as a path relative to
+  `canonical_root`. Paths passed to `drawer add --source-file` or
+  derived during mining are normalized at insert time: paths inside
+  `canonical_root` are re-expressed relative to it; paths outside
+  `canonical_root` are stored absolute.
+- **R-1022** — `source_file` stored by v0.7.x and earlier is not
+  guaranteed relative. `ndx recall rebuild-index` (v0.8.0+) rewrites
+  every drawer's `source_file` during the schema-v3 migration: values
+  whose prefix matches `canonical_root` become project-relative;
+  others are left as-is.
+- **R-1023** — `ndx xref drawer <path>` resolves the argument against
+  `canonical_root`: absolute paths inside `canonical_root` get the
+  prefix stripped; relative paths are joined with the current cwd's
+  project root first, then the prefix is stripped. Lookup compares
+  canonical-relative forms on both sides.
+- **R-1024** — `drawer add --source-file <path>` accepts either an
+  absolute or cwd-relative path; normalization happens before insert.
+
+### 19.4 CLI (R-1030)
+
+- **R-1031** — `ndx recall init [--link <canonical-root>]`. Without
+  `--link`, creates a new palace at `{cwd}/.ndx/recall.redb` and
+  stamps `canonical_root = <cwd>`. With `--link`, creates a symlink
+  at `{cwd}/.ndx/recall.redb` pointing to
+  `<canonical-root>/.ndx/recall.redb`; no new palace is created and
+  no `canonical_root` stamped locally (the target's is authoritative).
+- **R-1032** — `ndx recall link-palace <canonical-root>`. Replaces
+  the current checkout's `recall.redb` with a symlink to
+  `<canonical-root>/.ndx/recall.redb`. The argument is always a
+  project-root directory; the command appends `/.ndx/recall.redb`
+  internally.
+- **R-1033** — `ndx recall unlink-palace [--keep]`. Removes the
+  symlink. With `--keep`, first copies the target into a fresh local
+  palace via an MVCC read-txn walk (§19.6) so the checkout retains
+  its own copy.
+- **R-1034** — `ndx recall rehome <new-canonical-root>`. Rewrites the
+  `canonical_root` field in META. Does not move the palace file;
+  filesystem relocation is a separate action.
+
+### 19.5 Safety Guards (R-1040)
+
+- **R-1041** — `link-palace` MUST refuse if
+  `<canonical-root>/.ndx/recall.redb` does not exist or is not a
+  palace.
+- **R-1042** — `link-palace` MUST refuse if the current checkout's
+  palace has `drawer_count > 0`, unless `--force` is given. `--force`
+  deletes the current palace and replaces it with a symlink.
+- **R-1043** — `link-palace` MUST NOT chain symlinks. If
+  `<canonical-root>/.ndx/recall.redb` is itself a symlink, the
+  command resolves it once and links directly to the resolved target,
+  so every linked checkout points at the canonical directly.
+- **R-1044** — `init --link` MUST refuse if the target palace does
+  not yet exist. The user must `init` the canonical first.
+
+### 19.6 Concurrency and MVCC Backup (R-1050)
+
+- **R-1051** — Multiple checkouts MAY read and write a shared palace
+  concurrently. redb's single-writer flock serializes writes; reads
+  use MVCC snapshots and do not block writes.
+- **R-1052** — `unlink-palace --keep` opens a read transaction on the
+  shared palace, creates a new redb database at the checkout's local
+  path, and walks every table under the read snapshot, writing
+  entries into the local database in a single write txn on the
+  target. The copy completes from a frozen view; concurrent writes
+  on the source do not corrupt the copy.
+- **R-1053** — Long-running writers (e.g. `mine --from-memory`) hold
+  short bursty write txns. Other checkouts' reads interleave;
+  competing writes serialize on the flock. No additional coordination
+  is required.
+
+### 19.7 Schema v3 Migration (R-1060)
+
+- **R-1061** — Schema version bumps from 2 to 3. New META entry:
+  `canonical_root: String` (absolute path, UTF-8).
+- **R-1062** — `ndx recall rebuild-index` is extended. In addition to
+  rebuilding BM25 (v1→v2 work, idempotent on v2), it (a) stamps
+  `canonical_root` to the absolute path of the palace's project root
+  if not already set, and (b) rewrites every drawer's `source_file`
+  per R-1022. Both legs run in one command. Strict opens of a v2
+  palace return a schema-version error pointing to `rebuild-index`,
+  same as the v1→v2 flow.
+- **R-1063** — Linked secondary checkouts do not attempt migration;
+  their `recall.redb` is a symlink to the canonical, which the
+  canonical's owner migrates once.
+
+### 19.8 Status Surface (R-1070)
+
+- **R-1071** — `ndx recall status` (human output) displays:
+  - `Canonical root: <abs-path>`
+  - `Linked to: <abs-path>` if the current checkout's `recall.redb`
+    is a symlink; omitted otherwise.
+- **R-1072** — `ndx recall status --json` includes both
+  `canonical_root: <abs-path>` and `palace_linked_to: <abs-path> |
+  null`.
+
+---
+
 ## 18. Amendment Log
 
 *(Append-only. Each entry: date, phase, requirement IDs touched,
@@ -1099,3 +1228,17 @@ description, rationale.)*
   binary-path changes. Not a spec divergence — the spec's R-800
   series covers wake-up injection generically; PreCompact is an
   additional delivery channel. No new requirement IDs allocated.
+
+- **2026-04-22 / v0.8.0 / R-1000..R-1072** — Shared palaces. Multiple
+  checkouts of the same repository can delegate their palace to a
+  canonical checkout via `ndx recall link-palace` / `unlink-palace`
+  / `init --link`. Palace file is symlinked; file-index daemon and
+  files remain local. Schema bumps v2→v3 to stamp `canonical_root`
+  in META, which anchors project-relative `source_file`
+  interpretation. `rebuild-index` extended to perform both BM25
+  rebuild (v1→v2 work, idempotent on v2) and canonical_root stamping
+  + source_file normalization (v2→v3). New `ndx recall rehome`
+  command rewrites `canonical_root` for the rare relocation case.
+  MVCC-backed `unlink-palace --keep` copies the shared palace into a
+  fresh local redb via a read-txn table walk; no write flock is held
+  on the source, so other checkouts keep working.
