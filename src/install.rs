@@ -75,7 +75,11 @@ Per-project structured memory (`{project}/.ndx/recall.redb`). Drawers = atomic m
 ### Lifecycle
 ```bash
 ndx recall init                            # create the palace
-ndx recall status [--json]                 # counts, schema, embedding model, last mine
+ndx recall init --link <canonical-root>    # link a secondary checkout to a shared palace
+ndx recall link-palace <canonical-root>    # replace local palace with a symlink (--force to overwrite drawers)
+ndx recall unlink-palace [--keep]          # remove symlink; --keep copies the canonical palace locally first
+ndx recall rehome <new-canonical-root>     # rewrite canonical_root in META after canonical checkout moves
+ndx recall status [--json]                 # counts, schema, embedding model, canonical root, link target
 ```
 
 ### Mining (fill the palace)
@@ -148,7 +152,7 @@ ndx scan              # re-scan project index + memory database
 ndx install           # download command manifests, register hook + skill
 ndx init              # install ndx skills into current project
 ndx recall reembed    # backfill embeddings (downloads model if needed)
-ndx recall rebuild-index  # re-tokenize all drawers into BM25 (one-shot after 0.7.0 upgrade)
+ndx recall rebuild-index  # re-tokenize all drawers into BM25 (v1→v2) and stamp canonical_root + normalize source_file paths (v2→v3)
 ```
 "#;
 
