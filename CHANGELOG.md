@@ -1,6 +1,8 @@
 # Changelog
 
-## v0.8.0 — Unreleased
+## v0.8.1 — Unreleased
+
+## v0.8.0 — 2026-04-23
 
 - **Shared palaces via symlink** — multiple checkouts of the same repository can delegate their palace to a canonical checkout. New CLI commands: `ndx recall init --link <canonical-root>`, `ndx recall link-palace <canonical-root> [--force]`, `ndx recall unlink-palace [--keep]`, `ndx recall rehome <new-canonical-root>`. `--keep` makes an MVCC point-in-time copy of the canonical palace (via a read-txn table walk) so concurrent writers on the source don't block or corrupt the copy. Symlink chains are collapsed at link time — every linked checkout points at the canonical directly. `link-palace` refuses if the canonical target is missing, and refuses (without `--force`) when the local palace already contains drawers.
 - **Palace schema v3** — new `canonical_root` META entry (absolute path, UTF-8) stamped at init. `ndx recall rebuild-index` now performs both BM25 rebuild and v2→v3 migration (stamps `canonical_root`, rewrites every drawer's `source_file` to project-relative form where applicable) and is idempotent across v1/v2/v3 palaces. Strict opens of a v2 palace return a schema-version error pointing at `rebuild-index`.
