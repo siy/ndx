@@ -2,6 +2,10 @@
 
 ## v0.8.1 — Unreleased
 
+- New `/ndx-chore` orchestrator skill that walks the four palace-hygiene phases — classify, score, dedupe, contradict — to completion in one go, with concise per-phase judgment floors and a single review-needed total. The `/ndx` skill has been rewritten around lifecycle (daily/session-end/occasional/surgical) instead of a CLI-reference dump; the full reference is preserved under a `Reference` heading.
+- SessionEnd hook auto-mines the just-ended session into the palace (`mine --from-memory` scoped to the ending `session_id`, no embed). Observational — emits no `additionalContext`. Soft-fails when there is no palace rooted at `cwd`. Idempotent via the existing `MINED_SESSIONS` table.
+- SessionStart hook auto-mines pending sessions on launch (no embed) and emits an `additionalContext` nudge — `# ndx-recall — palace hygiene pending` — when the sum of pending classify + score + dedupe + contradict drawers reaches the threshold (default 20). Below threshold the hook is silent. Mirrors PreCompact's `hookSpecificOutput` shape. `ndx install` now registers four hooks: PreToolUse (Bash), PreCompact, SessionStart, SessionEnd.
+
 ## v0.8.0 — 2026-04-23
 
 - **Shared palaces via symlink** — multiple checkouts of the same repository can delegate their palace to a canonical checkout. New CLI commands: `ndx recall init --link <canonical-root>`, `ndx recall link-palace <canonical-root> [--force]`, `ndx recall unlink-palace [--keep]`, `ndx recall rehome <new-canonical-root>`. `--keep` makes an MVCC point-in-time copy of the canonical palace (via a read-txn table walk) so concurrent writers on the source don't block or corrupt the copy. Symlink chains are collapsed at link time — every linked checkout points at the canonical directly. `link-palace` refuses if the canonical target is missing, and refuses (without `--force`) when the local palace already contains drawers.
