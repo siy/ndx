@@ -13,8 +13,28 @@ use crate::recall::{
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Optional filters narrowing a `mine_from_memory` run.
+///
+/// Defaults are equivalent to the v0.8.0 behavior: walk every session
+/// for the palace's project, skip ones already mined unless `force`,
+/// and skip embeddings.
+#[derive(Debug, Clone, Default)]
+pub struct MineFromMemoryOpts<'a> {
+    /// Lower bound on `started_at` (ISO 8601). Inclusive.
+    pub since: Option<&'a str>,
+    /// Force re-mine even if `(session_id, source_modified)` is already
+    /// recorded in `MINED_SESSIONS`.
+    pub force: bool,
+    /// Generate embeddings during insert (slow). When false, the caller
+    /// is expected to backfill via `recall reembed`.
+    pub embed: bool,
+    /// When `Some`, only mine sessions whose `session_id` is in the set.
+    /// Used by the SessionEnd hook to mine just the session that ended.
+    pub session_ids: Option<HashSet<String>>,
+}
 
 /// Outcome counts for a mine run (R-454).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -50,6 +70,31 @@ pub fn mine_from_memory(
     force: bool,
     embed: bool,
 ) -> Result<MineReport> {
+    mine_from_memory_with_opts(
+        palace,
+        MineFromMemoryOpts {
+            since,
+            force,
+            embed,
+            session_ids: None,
+        },
+    )
+}
+
+/// Like [`mine_from_memory`] but with the full options struct so callers
+/// (e.g. the SessionEnd hook) can scope the run to a specific session_id
+/// set without invoking the legacy positional signature.
+pub fn mine_from_memory_with_opts(
+    palace: &Palace,
+    opts: MineFromMemoryOpts<'_>,
+) -> Result<MineReport> {
+    let MineFromMemoryOpts {
+        since,
+        force,
+        embed,
+        session_ids,
+    } = opts;
+
     let mem = MemoryIndex::open().context("failed to open global memory database")?;
     let project_path = palace.project_root().to_string_lossy().into_owned();
     let sessions = mem.list_sessions(Some(&project_path), usize::MAX)?;
@@ -63,6 +108,13 @@ pub fn mine_from_memory(
         if let Some(min) = since {
             let started = session.started_at.as_deref().unwrap_or("");
             if started < min {
+                continue;
+            }
+        }
+
+        // Filter by explicit session_id allowlist (SessionEnd hook).
+        if let Some(ref allow) = session_ids {
+            if !allow.contains(&session.session_id) {
                 continue;
             }
         }

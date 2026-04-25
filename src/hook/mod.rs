@@ -24,6 +24,24 @@ pub struct HookInput {
     #[serde(default)]
     #[allow(dead_code)]
     pub custom_instructions: Option<String>,
+    // SessionStart's "source" field: one of "startup", "resume",
+    // "clear", "compact". Currently deserialized for completeness so
+    // future SessionStart logic (e.g. matcher-style filtering) can read
+    // it without a wire change. allow(dead_code) until consumed.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub source: Option<String>,
+    // SessionEnd's "reason" field. Currently deserialized but not
+    // consumed; the SessionEnd handler treats every reason the same.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub reason: Option<String>,
+    // Path to the session transcript JSONL (SessionEnd, SessionStart).
+    // Currently unused by ndx but kept on the struct so we don't trip
+    // any future serde strictness flag.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub transcript_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +88,28 @@ pub struct PreCompactOutput {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreCompactSpecificOutput {
+    pub hook_event_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<String>,
+}
+
+// ── SessionStart output ──────────────────────────────────────────────
+//
+// SessionStart shares the exact JSON shape of PreCompact:
+// `hookSpecificOutput.{hookEventName, additionalContext}`. We expose
+// distinct type aliases so call sites stay self-documenting (a
+// SessionStart code path returning a `PreCompactOutput` would be
+// confusing to read).
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStartOutput {
+    pub hook_specific_output: SessionStartSpecificOutput,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStartSpecificOutput {
     pub hook_event_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_context: Option<String>,

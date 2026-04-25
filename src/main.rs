@@ -377,22 +377,42 @@ fn cmd_hook() -> Result<()> {
     // Phase 5 wake-up injection path.
     let hook_input: Option<hook::HookInput> = serde_json::from_str(&input).ok();
 
-    // Dispatch on hook event name. PreCompact has its own output schema
-    // (narrower `hookSpecificOutput`) and must always re-inject the
-    // L0+L1 wake-up text to survive compaction. All other events fall
-    // through to the existing PreToolUse Bash flow.
+    // Dispatch on hook event name. PreCompact, SessionStart and
+    // SessionEnd each have their own output schema (or no output at
+    // all) and must short-circuit before the PreToolUse Bash flow.
     if let Some(hi) = hook_input.as_ref() {
-        if hi.hook_event_name.as_deref() == Some("PreCompact") {
-            match build_precompact_output(hi) {
-                Ok(Some(out)) => {
-                    println!("{}", serde_json::to_string(&out)?);
+        match hi.hook_event_name.as_deref() {
+            Some("PreCompact") => {
+                match build_precompact_output(hi) {
+                    Ok(Some(out)) => {
+                        println!("{}", serde_json::to_string(&out)?);
+                    }
+                    Ok(None) => {} // silent soft-skip
+                    Err(e) => {
+                        eprintln!("[ndx hook] PreCompact injection skipped: {}", e);
+                    }
                 }
-                Ok(None) => {} // silent soft-skip (no palace, no session, etc.)
-                Err(e) => {
-                    eprintln!("[ndx hook] PreCompact injection skipped: {}", e);
-                }
+                return Ok(());
             }
-            return Ok(());
+            Some("SessionStart") => {
+                match build_session_start_output(hi) {
+                    Ok(Some(out)) => {
+                        println!("{}", serde_json::to_string(&out)?);
+                    }
+                    Ok(None) => {} // silent soft-skip (no palace, etc.)
+                    Err(e) => {
+                        eprintln!("[ndx hook] SessionStart skipped: {}", e);
+                    }
+                }
+                return Ok(());
+            }
+            Some("SessionEnd") => {
+                if let Err(e) = handle_session_end(hi) {
+                    eprintln!("[ndx hook] SessionEnd skipped: {}", e);
+                }
+                return Ok(());
+            }
+            _ => {}
         }
     }
 
@@ -571,6 +591,143 @@ fn build_precompact_output(
             additional_context: Some(block),
         },
     }))
+}
+
+/// Threshold for emitting the `/ndx-chore` nudge from the SessionStart
+/// hook. Sum of pending classify + score + dedupe + contradict drawers.
+const SESSION_START_NUDGE_THRESHOLD: usize = 20;
+
+/// SessionStart hook handler.
+///
+/// Behavior:
+///   1. Walk up from `cwd` for a palace; soft-fail (Ok(None)) if missing.
+///   2. Auto-mine since `last_mined_at` (no embed). Best-effort: log on
+///      failure, continue to the nudge.
+///   3. Count pending hygiene drawers across the four `/ndx-chore`
+///      phases. If sum ≥ threshold, emit `additionalContext` nudging
+///      the user toward `/ndx-chore`. Below threshold: Ok(None).
+///
+/// Soft-fail philosophy mirrors PreCompact: any error returns Ok(None)
+/// (no output, exit 0) rather than disrupting the launch. `Err` is
+/// reserved for programming bugs the caller surfaces on stderr.
+fn build_session_start_output(
+    hi: &hook::HookInput,
+) -> Result<Option<hook::SessionStartOutput>> {
+    let cwd = match hi.cwd.as_deref() {
+        Some(c) if !c.is_empty() => std::path::PathBuf::from(c),
+        _ => return Ok(None),
+    };
+    let root = match find_palace_root(&cwd) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let palace = match Palace::open_at(root) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+
+    // Best-effort auto-mine. Any error here must not block the nudge.
+    if let Err(e) = recall::mine::mine_from_memory_with_opts(
+        &palace,
+        recall::mine::MineFromMemoryOpts::default(),
+    ) {
+        eprintln!("[ndx hook] SessionStart auto-mine skipped: {}", e);
+    }
+
+    session_start_nudge_for(&palace)
+}
+
+/// Pure subroutine of [`build_session_start_output`]: given a palace,
+/// produce the SessionStart nudge if the hygiene backlog is at or above
+/// [`SESSION_START_NUDGE_THRESHOLD`]. Skips the auto-mine side effect so
+/// it can be exercised in unit tests without touching the global memory
+/// database.
+fn session_start_nudge_for(
+    palace: &Palace,
+) -> Result<Option<hook::SessionStartOutput>> {
+    // Count pending across the four /ndx-chore phases. Use a generous
+    // limit so we get a meaningful count rather than a clipped value
+    // when the backlog is very large.
+    let (n_classify, n_score, n_dedupe, n_contradict) =
+        pending_hygiene_counts(palace).unwrap_or((0, 0, 0, 0));
+    let total = n_classify + n_score + n_dedupe + n_contradict;
+
+    if total < SESSION_START_NUDGE_THRESHOLD {
+        return Ok(None);
+    }
+
+    let block = format!(
+        "# ndx-recall — palace hygiene pending\n\
+         {} drawers need classification, {} need importance scoring,\n\
+         {} dedupe candidates, {} contradictions.\n\
+         Run `/ndx-chore` to work through them.\n",
+        n_classify, n_score, n_dedupe, n_contradict,
+    );
+
+    Ok(Some(hook::SessionStartOutput {
+        hook_specific_output: hook::SessionStartSpecificOutput {
+            hook_event_name: "SessionStart".to_string(),
+            additional_context: Some(block),
+        },
+    }))
+}
+
+/// Sum of pending counts across classify/score/dedupe/contradict.
+/// Each is capped at a generous limit; we only need an order-of-magnitude
+/// signal, not an exact count.
+fn pending_hygiene_counts(palace: &Palace) -> Result<(usize, usize, usize, usize)> {
+    use recall::PendingOp;
+    const CAP: usize = 1000;
+    let n_classify = palace.list_pending(PendingOp::Classify, CAP)?.len();
+    let n_score = palace.list_pending(PendingOp::Score, CAP)?.len();
+    let n_dedupe = palace.list_pending(PendingOp::Dedupe, CAP)?.len();
+    let n_contradict = palace.list_pending(PendingOp::Contradict, CAP)?.len();
+    Ok((n_classify, n_score, n_dedupe, n_contradict))
+}
+
+/// SessionEnd hook handler. Observational — no JSON output, exit 0.
+///
+/// Mines the just-ended session into the palace (raw, no embed). Reuses
+/// `MINED_SESSIONS` for idempotency: if the session was already mined
+/// (e.g. an earlier SessionStart already covered it), this becomes a
+/// no-op for that session.
+fn handle_session_end(hi: &hook::HookInput) -> Result<()> {
+    let cwd = match hi.cwd.as_deref() {
+        Some(c) if !c.is_empty() => std::path::PathBuf::from(c),
+        _ => return Ok(()),
+    };
+    let root = match find_palace_root(&cwd) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let palace = match Palace::open_at(root) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+
+    let session_id = match hi.session_id.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            // Without a session_id we cannot scope; soft-skip.
+            return Ok(());
+        }
+    };
+
+    let mut allow = std::collections::HashSet::new();
+    allow.insert(session_id);
+
+    if let Err(e) = recall::mine::mine_from_memory_with_opts(
+        &palace,
+        recall::mine::MineFromMemoryOpts {
+            since: None,
+            force: false,
+            embed: false,
+            session_ids: Some(allow),
+        },
+    ) {
+        eprintln!("[ndx hook] SessionEnd mine skipped: {}", e);
+    }
+    Ok(())
 }
 
 /// Walk up from a starting directory looking for an existing
@@ -1852,6 +2009,9 @@ mod precompact_tests {
             hook_event_name: Some("PreCompact".into()),
             trigger: Some("manual".into()),
             custom_instructions: None,
+            source: None,
+            reason: None,
+            transcript_path: None,
         };
         let out = build_precompact_output(&hi).unwrap();
         assert!(out.is_none(), "missing cwd must soft-fail with None");
@@ -1868,6 +2028,9 @@ mod precompact_tests {
             hook_event_name: Some("PreCompact".into()),
             trigger: Some("auto".into()),
             custom_instructions: None,
+            source: None,
+            reason: None,
+            transcript_path: None,
         };
         let out = build_precompact_output(&hi).unwrap();
         assert!(out.is_none(), "no palace must soft-fail with None");
@@ -1888,6 +2051,9 @@ mod precompact_tests {
             hook_event_name: Some("PreCompact".into()),
             trigger: Some("manual".into()),
             custom_instructions: Some("".into()),
+            source: None,
+            reason: None,
+            transcript_path: None,
         };
         let out = build_precompact_output(&hi).unwrap().expect("output");
 
@@ -1950,10 +2116,177 @@ mod precompact_tests {
             hook_event_name: Some("PreCompact".into()),
             trigger: Some("auto".into()),
             custom_instructions: None,
+            source: None,
+            reason: None,
+            transcript_path: None,
         };
         let out1 = build_precompact_output(&hi).unwrap();
         let out2 = build_precompact_output(&hi).unwrap();
         assert!(out1.is_some(), "first call must emit");
         assert!(out2.is_some(), "second call must still emit");
+    }
+
+    // ── SessionStart ─────────────────────────────────────────────────
+
+    fn mk_unclassified(text: &str) -> Drawer {
+        let mut d = mk_drawer(text, recall::DEFAULT_IMPORTANCE, recall::UNCLASSIFIED_ROOM);
+        // Mark as memory-mined so list_pending(Score) considers it.
+        d.source_kind = SourceKind::Memory;
+        d
+    }
+
+    /// Insert N drawers into the unclassified room with default importance.
+    /// They count toward both `classify` and `score` pending queues
+    /// (source_kind != Manual).
+    fn fill_unclassified(palace: &Palace, n: usize) {
+        for i in 0..n {
+            let d = mk_unclassified(&format!("pending fragment number {} for hygiene tests", i));
+            palace.insert_drawer_no_embedding(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn session_start_hook_empty_below_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let palace = Palace::create_at(tmp.path().to_path_buf()).unwrap();
+        // Far below the 20-drawer threshold (each unclassified drawer
+        // counts toward both classify and score, so 5 → 10 total).
+        fill_unclassified(&palace, 5);
+
+        let out = session_start_nudge_for(&palace).unwrap();
+        assert!(
+            out.is_none(),
+            "below threshold must produce no additionalContext"
+        );
+    }
+
+    #[test]
+    fn session_start_hook_emits_nudge_when_above_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let palace = Palace::create_at(tmp.path().to_path_buf()).unwrap();
+        // 25 unclassified → 25 classify + 25 score = 50 ≥ 20.
+        fill_unclassified(&palace, 25);
+
+        let out = session_start_nudge_for(&palace)
+            .unwrap()
+            .expect("must emit when backlog crosses threshold");
+        let body = out
+            .hook_specific_output
+            .additional_context
+            .as_deref()
+            .unwrap();
+        assert!(
+            body.contains("Run `/ndx-chore`"),
+            "nudge must invite /ndx-chore: {}",
+            body
+        );
+        assert!(
+            body.contains("ndx-recall — palace hygiene pending"),
+            "nudge must use the agreed header: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn session_start_hook_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let palace = Palace::create_at(tmp.path().to_path_buf()).unwrap();
+        fill_unclassified(&palace, 25);
+
+        let out = session_start_nudge_for(&palace).unwrap().expect("output");
+        let json = serde_json::to_string(&out).unwrap();
+
+        // Must mirror the PreCompact JSON shape: hookSpecificOutput with
+        // hookEventName + additionalContext, no permissionDecision.
+        assert!(
+            json.contains("\"hookSpecificOutput\""),
+            "json: {}",
+            json
+        );
+        assert!(
+            json.contains("\"hookEventName\":\"SessionStart\""),
+            "json: {}",
+            json
+        );
+        assert!(json.contains("\"additionalContext\""), "json: {}", json);
+        assert!(
+            !json.contains("permissionDecision"),
+            "SessionStart must not emit permissionDecision: {}",
+            json
+        );
+        assert!(
+            !json.contains("updatedInput"),
+            "SessionStart must not emit updatedInput: {}",
+            json
+        );
+    }
+
+    // ── SessionEnd ───────────────────────────────────────────────────
+
+    #[test]
+    fn session_end_hook_soft_fails_without_palace() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No palace at this dir.
+        let hi = hook::HookInput {
+            session_id: Some("sess-end-1".into()),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            tool_name: None,
+            tool_input: None,
+            hook_event_name: Some("SessionEnd".into()),
+            trigger: None,
+            custom_instructions: None,
+            source: None,
+            reason: Some("other".into()),
+            transcript_path: None,
+        };
+        // Must not panic / error — soft-fail.
+        handle_session_end(&hi).unwrap();
+    }
+
+    #[test]
+    fn session_end_hook_soft_fails_without_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(make_palace(tmp.path()));
+        let hi = hook::HookInput {
+            session_id: None,
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            tool_name: None,
+            tool_input: None,
+            hook_event_name: Some("SessionEnd".into()),
+            trigger: None,
+            custom_instructions: None,
+            source: None,
+            reason: Some("other".into()),
+            transcript_path: None,
+        };
+        handle_session_end(&hi).unwrap();
+    }
+
+    /// `mine_from_memory_with_opts` with a `session_ids` filter that
+    /// matches no session in global memory must return Ok with zero
+    /// added drawers — i.e. the SessionEnd hook idempotently no-ops
+    /// when the just-ended session was never recorded in memory.redb.
+    /// This is the closest we can get to an end-to-end test without
+    /// stubbing out the global memory database in a non-test process.
+    #[test]
+    fn session_end_mine_filter_no_match_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let palace = Palace::create_at(tmp.path().to_path_buf()).unwrap();
+
+        let mut allow = std::collections::HashSet::new();
+        allow.insert("nonexistent-session-id-xyz-9999".to_string());
+
+        let report = recall::mine::mine_from_memory_with_opts(
+            &palace,
+            recall::mine::MineFromMemoryOpts {
+                since: None,
+                force: false,
+                embed: false,
+                session_ids: Some(allow),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.added, 0, "no matching session → zero added");
+        assert_eq!(report.deduped, 0);
     }
 }

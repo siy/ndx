@@ -10,12 +10,25 @@ const SKILL_CONTENT: &str = r#"# ndx — Fast File Index, Memory Search, Recall 
 
 Use the `ndx` CLI for trigram-accelerated file search, project file listing, session memory queries, cross-referencing, and the per-project **recall palace** (structured episodic memory). ndx is available via Bash and works in all contexts including subagents.
 
-## When to use ndx
+## Lifecycle — when to do what
 
-- **Content search across many files** — faster than grep for large codebases due to trigram index
+The palace is **mined automatically** by the SessionStart and SessionEnd hooks; you almost never need to invoke `mine` by hand. Curation, however, is a judgment task and stays explicit:
+
+- **Daily / per session** — Run `/ndx-chore` after a notable mine (or once per week even when quiet). It walks classify → score → dedupe → contradict to completion in one go and prints a per-phase summary.
+- **Session-end** — Run `/ndx-recall-handover` before `/exit` to capture durable insights as memory files for the next session. SessionStart's auto-mine cannot recover lessons you didn't write down.
+- **Occasional** — Run `/ndx-recall-summarize` after large mining/classification rounds to refresh the per-room summary drawers that surface first in L1 wake-up.
+- **Surgical review** — When `/ndx-chore` flags something specific, drop into the focused skill: `/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`. Each one walks a single pending queue with full rule detail.
+
+If a SessionStart nudge appears in your context (`# ndx-recall — palace hygiene pending`), that's the harness telling you the backlog crossed the threshold — run `/ndx-chore`.
+
+## When to reach for the CLI directly
+
+- **Content search across many files** — faster than grep for large codebases due to the trigram index
 - **Session memory** — find what was discussed or done in previous Claude Code sessions
 - **Cross-referencing** — find which sessions touched a file, or what files a session modified
-- **Recall palace** — durable memory of decisions, rationale, architecture, and people, searchable via hybrid semantic + lexical search
+- **Recall palace lookup** — `ndx recall search "query"` for hybrid retrieval, `ndx recall wake` for the L0+L1 context block
+
+# Reference
 
 ## File Index Commands
 
@@ -124,8 +137,9 @@ ndx recall identity edit [--project]       # opens $EDITOR on identity.toml
 
 ### Skill-assisted maintenance
 
-The palace ingests everything raw. Quality (room assignment, importance, deduplication, contradiction flagging, summarization) is curated via five dedicated slash commands:
+The palace ingests everything raw. Quality (room assignment, importance, deduplication, contradiction flagging, summarization) is curated via slash commands:
 
+- `/ndx-chore` — orchestrator: walks classify → score → dedupe → contradict to completion in one go (preferred entry point)
 - `/ndx-recall-classify` — assign rooms to `unclassified` drawers
 - `/ndx-recall-score` — set meaningful importance on default-5 drawers
 - `/ndx-recall-dedupe` — merge near-duplicates
@@ -133,7 +147,7 @@ The palace ingests everything raw. Quality (room assignment, importance, dedupli
 - `/ndx-recall-summarize` — produce per-room summary drawers
 - `/ndx-recall-handover` — save session insights as memories for the next Claude session
 
-Run classify/score/dedupe after large mines. Run handover at the end of any significant session.
+Use `/ndx-chore` as your daily maintenance entry point. Drop into the focused skills only for surgical review.
 
 ## Cross-Reference Commands
 
@@ -448,6 +462,115 @@ Produce one high-quality summary drawer per active room. Summary drawers are sto
 - The `_summary_` room is reserved. Don't put non-summary content there.
 "#;
 
+const SKILL_CHORE: &str = r#"# /ndx-chore — Palace maintenance orchestrator
+
+Walk the four palace-hygiene phases — classify, score, dedupe, contradict — to completion in one go. This is the daily/per-session maintenance entry point. Use the focused sub-skills (`/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`) only for surgical review.
+
+`/ndx-chore` does **not** run summarize (run after big curation rounds) or handover (run before `/exit`). Those are different cadences.
+
+## Phases (run in order)
+
+For each phase, fetch the pending queue, walk it to empty, and print a one-line summary.
+
+### Phase 1: Classify
+
+```bash
+ndx recall drawer list --pending classify --limit 25 --json
+```
+
+Returns drawers with `room == "unclassified"`. For each one:
+- Decide the best-fitting room from `project.existing_rooms`. Create a new room only when none fits.
+- Bulk-classify by source file first when the pattern is obvious:
+  ```bash
+  ndx recall drawer update --source-file CHANGELOG.md --room releases
+  ```
+- Otherwise: `ndx recall drawer update --id <N> --room <name>` (auto-creates the room).
+- Pure noise (separators, single punctuation, boilerplate headers): `ndx recall drawer rm --id <N>`.
+
+Floor rules:
+- Room names: lowercase, `[a-z0-9_-]+`, ≤64 chars.
+- If a drawer is genuinely ambiguous, leave it as `unclassified` and move on — do not invent rooms to clear the queue.
+- Re-fetch the batch after bulk moves to see what remains.
+
+Stop: `ndx recall drawer list --pending classify --limit 1 --json` returns an empty `drawers` array.
+
+Print: `classify: N assigned, M skipped` (skipped = drawers you left ambiguous).
+
+### Phase 2: Score
+
+```bash
+ndx recall drawer list --pending score --limit 25 --json
+```
+
+Returns drawers with `importance == 5` and `source_kind != Manual`. For each one:
+- Bulk-score by source file when patterns are clear: `ndx recall drawer update --source-file CHANGELOG.md --importance 4`.
+- Otherwise: `ndx recall drawer update --id <N> --importance <1..10>`.
+- Aggressive noise (markdown separators, headings with no body): score 1-2 or `drawer rm`.
+
+Floor rules (1-10 scale):
+- **10** — core identity, irreversible constraints. Always wake-up loaded.
+- **7-9** — important decisions, rationale, architectural pillars, regular collaborators.
+- **4-6** — normal context, code patterns, general project facts.
+- **1-3** — low-signal noise, incidental output, dedup-amplified boilerplate.
+
+Be stingy with 9-10. When uncertain, pick the lower value.
+
+Stop: pending queue empty.
+
+Print: `score: N rated, M skipped`.
+
+### Phase 3: Dedupe
+
+```bash
+ndx recall drawer list --pending dedupe --limit 20 --json
+```
+
+Returns clusters of drawers sharing content-hash prefixes. For each cluster:
+- **True duplicates** (same claim, same angle): keep the highest-importance one, `drawer rm` the rest, optionally bump survivor's importance.
+- **Complementary** (same claim, different detail): merge text into one with `drawer update --text "..."`, `drawer rm` the others.
+- **Coincidental hash collision**: skip — they are not actually related.
+- **Timeline** ("we use Postgres" → "we switched to Cockroach"): use `drawer link --kind supersedes` instead of merging or deleting.
+
+Floor rules:
+- Be conservative. When in doubt, leave duplicates alone — extra noise is recoverable, lost content is not.
+- Prefer `supersedes` links over deletion when the older drawer has historical value.
+
+Stop: pending queue empty.
+
+Print: `dedupe: N merged, M superseded, K skipped`.
+
+### Phase 4: Contradict
+
+```bash
+ndx recall drawer list --pending contradict --limit 30 --json
+```
+
+Returns drawers that already participate in some link. For each candidate pair:
+- Real contradiction (incompatible claims about the same topic): `ndx recall drawer link --from <A> --to <B> --kind contradicts`.
+- One side is clearly stale: use `--kind supersedes` from the correct one to the stale one (hides stale from L1).
+- Different topics that share vocabulary, complementary facts, or sequential decisions: skip.
+
+Floor rules:
+- Judgment-heavy. When unsure, do nothing — false `contradicts` links add noise; missed ones are recoverable.
+- If it takes a paragraph of reasoning to see the conflict, it probably is not one.
+- Report unresolved contradictions to the user at the end.
+
+Stop: pending queue empty.
+
+Print: `contradict: N flagged, M superseded, K skipped`.
+
+## Stopping criteria
+
+- All four phases must walk their queue to empty (or to a steady-state where every remaining item is a deliberate skip).
+- If a drawer cannot be judged confidently, **skip it and continue** — do not abort the phase.
+- If all four phases start empty: print `nothing to do` and exit.
+- At the end, count drawers that need user review (unresolved contradictions, ambiguous classifications you flagged) and print: `review needed: N drawers`.
+
+## Escape hatch
+
+When a phase produces too many ambiguous decisions or you want full rule detail with examples, drop into the focused sub-skill: `/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`. Each one covers a single phase exhaustively.
+"#;
+
 pub fn run_install() -> Result<()> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let ndx_dir = home.join(".ndx");
@@ -468,7 +591,7 @@ pub fn run_install() -> Result<()> {
     let settings_path = home.join(".claude").join("settings.json");
     register_claude_settings(&settings_path, &ndx_bin_str)?;
     eprintln!(
-        "  Hook: PreToolUse (Bash) + PreCompact hooks registered in {}",
+        "  Hook: PreToolUse (Bash), PreCompact, SessionStart, SessionEnd registered in {}",
         settings_path.display()
     );
 
@@ -504,7 +627,7 @@ const CLAUDE_MD_NDX_SECTION: &str = r#"
 
 Key commands: `ndx recall search "query"` (hybrid search), `ndx recall wake` (context), `ndx xref drawer <file>` (cross-ref).
 
-Skills: `/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`, `/ndx-recall-summarize`, `/ndx-recall-handover`.
+Skills: `/ndx-chore` (daily maintenance orchestrator), `/ndx-recall-classify`, `/ndx-recall-score`, `/ndx-recall-dedupe`, `/ndx-recall-contradict`, `/ndx-recall-summarize`, `/ndx-recall-handover`.
 
 If recall palace is not initialized, run `ndx recall init` then `ndx recall mine --from-memory`.
 "#;
@@ -557,6 +680,7 @@ pub fn ensure_gitignore_entry(project_dir: &Path) -> Result<()> {
 /// recall palace maintenance.
 pub const SKILL_FILES: &[(&str, &str)] = &[
     ("ndx.md", SKILL_CONTENT),
+    ("ndx-chore.md", SKILL_CHORE),
     ("ndx-recall-classify.md", SKILL_RECALL_CLASSIFY),
     ("ndx-recall-score.md", SKILL_RECALL_SCORE),
     ("ndx-recall-dedupe.md", SKILL_RECALL_DEDUPE),
@@ -623,6 +747,45 @@ fn download_manifests(commands_dir: &PathBuf) -> usize {
     eprintln!();
 
     downloaded.load(Ordering::Relaxed)
+}
+
+/// Idempotently register an ndx-owned hook entry for a `hook_event_name`
+/// that takes no matcher (PreCompact, SessionStart, SessionEnd). Strips
+/// any existing ndx-owned entry first so a re-install picks up a new
+/// `ndx_bin` path or status message.
+fn register_event_hook(
+    hooks_obj: &mut serde_json::Map<String, serde_json::Value>,
+    event_name: &str,
+    ndx_bin: &str,
+    status_message: &str,
+) {
+    let entry = hooks_obj
+        .entry(event_name.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+
+    if let Some(arr) = entry.as_array_mut() {
+        arr.retain(|entry| {
+            if let Some(hooks_arr) = entry.get("hooks").and_then(|v| v.as_array()) {
+                for h in hooks_arr {
+                    if let Some(cmd) = h.get("command").and_then(|v| v.as_str()) {
+                        if cmd.contains("ndx") && cmd.contains("hook") {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        });
+
+        arr.push(serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("{} hook", ndx_bin),
+                "timeout": 10,
+                "statusMessage": status_message,
+            }]
+        }));
+    }
 }
 
 fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()> {
@@ -693,36 +856,28 @@ fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()
         }
 
         // ── PreCompact (no matcher → fires for manual + auto) ─────────
-        let pre_compact = hooks_obj
-            .entry("PreCompact")
-            .or_insert_with(|| serde_json::json!([]));
+        register_event_hook(
+            hooks_obj,
+            "PreCompact",
+            ndx_bin,
+            "ndx: re-injecting recall palace wake-up...",
+        );
 
-        if let Some(arr) = pre_compact.as_array_mut() {
-            // Remove existing ndx PreCompact entries so the refresh is
-            // idempotent and any command-path change (e.g., when the
-            // user moves ~/.local/bin/ndx) takes effect.
-            arr.retain(|entry| {
-                if let Some(hooks_arr) = entry.get("hooks").and_then(|v| v.as_array()) {
-                    for h in hooks_arr {
-                        if let Some(cmd) = h.get("command").and_then(|v| v.as_str()) {
-                            if cmd.contains("ndx") && cmd.contains("hook") {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                true
-            });
+        // ── SessionStart (no matcher → fires on startup/resume/clear/compact) ─
+        register_event_hook(
+            hooks_obj,
+            "SessionStart",
+            ndx_bin,
+            "ndx: auto-mining recent sessions...",
+        );
 
-            arr.push(serde_json::json!({
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{} hook", ndx_bin),
-                    "timeout": 10,
-                    "statusMessage": "ndx: re-injecting recall palace wake-up..."
-                }]
-            }));
-        }
+        // ── SessionEnd (observational, no additionalContext) ──────────
+        register_event_hook(
+            hooks_obj,
+            "SessionEnd",
+            ndx_bin,
+            "ndx: mining ended session...",
+        );
     }
 
     let output = serde_json::to_string_pretty(&settings)?;
@@ -828,5 +983,58 @@ mod tests {
             })
             .collect();
         assert_eq!(hits.len(), 1, "PreCompact must track the new bin path");
+    }
+
+    /// Two installs must leave exactly one SessionStart and one
+    /// SessionEnd entry.
+    #[test]
+    fn install_registers_session_hooks_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        let ndx_bin = "/tmp/fake/ndx";
+
+        register_claude_settings(&settings_path, ndx_bin).unwrap();
+        register_claude_settings(&settings_path, ndx_bin).unwrap();
+
+        let body = std::fs::read_to_string(&settings_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        for event in ["SessionStart", "SessionEnd"] {
+            let arr = v
+                .pointer(&format!("/hooks/{}", event))
+                .and_then(|x| x.as_array())
+                .unwrap_or_else(|| panic!("{} array missing", event));
+            let ndx_entries: Vec<_> = arr
+                .iter()
+                .filter(|e| {
+                    e.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|inner| {
+                            inner.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|c| c.contains("ndx"))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert_eq!(
+                ndx_entries.len(),
+                1,
+                "{} should have exactly one ndx entry after two installs",
+                event
+            );
+            // No `matcher` key — these events do not use matchers.
+            for e in &ndx_entries {
+                assert!(
+                    e.get("matcher").is_none(),
+                    "{} entries must not include a matcher key: {:?}",
+                    event,
+                    e
+                );
+            }
+        }
     }
 }
