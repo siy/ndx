@@ -459,6 +459,8 @@ pub fn list_files(
     path: Option<&str>,
     pattern: Option<&str>,
     sort: Option<&str>,
+    show_tokens: bool,
+    json: bool,
 ) -> Result<String, String> {
     let sort_modified = sort == Some("modified");
     let glob_matcher = match pattern {
@@ -466,7 +468,12 @@ pub fn list_files(
         None => None,
     };
 
-    if sort_modified {
+    // JSON output and `--tokens` both need file size, which is only
+    // available via the meta-bearing list. Fast path (paths-only) is
+    // kept for the common no-frills call to avoid loading metadata.
+    let needs_meta = sort_modified || show_tokens || json;
+
+    if needs_meta {
         let mut entries = if let Some(prefix) = path {
             let prefix = if prefix.ends_with('/') {
                 prefix.to_string()
@@ -484,13 +491,11 @@ pub fn list_files(
             entries.retain(|(p, _)| glob.is_match(p.as_str()));
         }
 
-        entries.sort_by(|a, b| b.1.modified.cmp(&a.1.modified));
+        if sort_modified {
+            entries.sort_by(|a, b| b.1.modified.cmp(&a.1.modified));
+        }
 
-        Ok(entries
-            .iter()
-            .map(|(p, e)| format!("{}\t{}", p, format_modified(e.modified)))
-            .collect::<Vec<_>>()
-            .join("\n"))
+        Ok(format_file_list(&entries, sort_modified, show_tokens, json))
     } else {
         let mut paths = if let Some(prefix) = path {
             let prefix = if prefix.ends_with('/') {
@@ -511,27 +516,75 @@ pub fn list_files(
     }
 }
 
+/// Render a `(path, FileEntry)` slice as either a JSON array of
+/// objects (`json=true`) or a tab-separated plain listing. The plain
+/// columns are: path, optional `modified`, optional `tokens=<N>`.
+fn format_file_list(
+    entries: &[(String, crate::index::FileEntry)],
+    show_modified: bool,
+    show_tokens: bool,
+    json: bool,
+) -> String {
+    if json {
+        let arr: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(p, e)| {
+                serde_json::json!({
+                    "path": p,
+                    "size": e.size,
+                    "modified": format_modified(e.modified),
+                    "tokens": crate::tokens::estimate_tokens(p, e.size),
+                })
+            })
+            .collect();
+        return serde_json::to_string(&arr).unwrap_or_default();
+    }
+
+    entries
+        .iter()
+        .map(|(p, e)| {
+            let mut line = p.clone();
+            if show_modified {
+                line.push('\t');
+                line.push_str(&format_modified(e.modified));
+            }
+            if show_tokens {
+                line.push('\t');
+                line.push_str(&format!(
+                    "tokens={}",
+                    crate::tokens::estimate_tokens(p, e.size)
+                ));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn search_files(
     index: &Index,
     pattern: &str,
     sort: Option<&str>,
+    show_tokens: bool,
+    json: bool,
 ) -> Result<String, String> {
     let glob = Glob::new(pattern)
         .map_err(|e| e.to_string())?
         .compile_matcher();
 
-    if sort == Some("modified") {
+    let sort_modified = sort == Some("modified");
+    let needs_meta = sort_modified || show_tokens || json;
+
+    if needs_meta {
         let all = index.list_all_with_meta().map_err(|e| e.to_string())?;
         let mut matched: Vec<_> = all
             .into_iter()
             .filter(|(p, _)| glob.is_match(p.as_str()))
             .collect();
-        matched.sort_by(|a, b| b.1.modified.cmp(&a.1.modified));
-        Ok(matched
-            .iter()
-            .map(|(p, e)| format!("{}\t{}", p, format_modified(e.modified)))
-            .collect::<Vec<_>>()
-            .join("\n"))
+        if sort_modified {
+            matched.sort_by(|a, b| b.1.modified.cmp(&a.1.modified));
+        }
+        Ok(format_file_list(&matched, sort_modified, show_tokens, json))
     } else {
         let all = index.list_all().map_err(|e| e.to_string())?;
         let matched: Vec<&String> = all.iter().filter(|p| glob.is_match(p.as_str())).collect();

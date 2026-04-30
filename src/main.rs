@@ -7,6 +7,7 @@ mod memory;
 mod recall;
 mod scanner;
 mod server;
+mod tokens;
 mod trigram;
 mod watcher;
 
@@ -85,6 +86,10 @@ fn get_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(|w| w[1].as_str())
 }
 
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
 fn get_flag_usize(args: &[String], flag: &str) -> Option<usize> {
     get_flag(args, flag).and_then(|v| v.parse().ok())
 }
@@ -159,6 +164,12 @@ fn cmd_list(args: &[String]) -> Result<()> {
     if let Some(s) = get_flag(args, "--sort") {
         params["sort"] = serde_json::json!(s);
     }
+    if has_flag(args, "--tokens") {
+        params["tokens"] = serde_json::json!(true);
+    }
+    if has_flag(args, "--json") {
+        params["json"] = serde_json::json!(true);
+    }
 
     let root = project_root()?;
     let result = client::query(&root, "list_files", params)?;
@@ -175,6 +186,12 @@ fn cmd_find(args: &[String]) -> Result<()> {
     let mut params = serde_json::json!({"pattern": pattern});
     if let Some(s) = get_flag(args, "--sort") {
         params["sort"] = serde_json::json!(s);
+    }
+    if has_flag(args, "--tokens") {
+        params["tokens"] = serde_json::json!(true);
+    }
+    if has_flag(args, "--json") {
+        params["json"] = serde_json::json!(true);
     }
 
     let root = project_root()?;

@@ -146,13 +146,19 @@ ndx search "pattern" --offset 100       # pagination
 
 ndx list                                # list all indexed files
 ndx list --path src/ --pattern "*.rs"   # filter by prefix and glob
-ndx list --sort modified               # sort by modification time
+ndx list --sort modified                # sort by modification time
+ndx list --tokens                       # append rough token-cost column (size / per-extension ratio)
+ndx list --json                         # JSON: path, size, modified, tokens — always includes tokens
 
 ndx find "**/*.toml"                    # find files matching glob
 ndx find "src/**/*.rs" --sort modified
+ndx find "**/*.rs" --tokens             # token cost per matched file
+ndx find "**/*" --json                  # structured output for scripts and Claude
 
 ndx status                              # index + memory statistics
 ```
+
+Token estimates are `size_bytes / ratio_for_extension`, deliberately rough — useful for "which of these files is cheapest to read", not exact tokenization. Code (`.rs`, `.py`, `.go`, …) tokenizes at ~3.0; prose (`.md`, `.txt`) at ~3.8; whitespace-heavy (`.json`, `.yaml`, `.toml`) at ~4.5; default 3.5.
 
 ### Memory commands
 

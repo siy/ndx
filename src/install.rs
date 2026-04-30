@@ -50,13 +50,19 @@ ndx list                                  # all indexed files
 ndx list --path src/                      # files under src/
 ndx list --pattern "*.rs"                 # filter by glob
 ndx list --sort modified                  # newest first
+ndx list --tokens                         # append rough token-cost column (size / per-extension ratio)
+ndx list --json                           # JSON: path, size, modified, tokens
 ```
 
 ### Find files by glob
 ```bash
 ndx find "**/*.toml"
 ndx find "src/**/*.rs" --sort modified
+ndx find "**/*.rs" --tokens               # token cost per matched file
+ndx find "**/*" --json                    # structured output (always includes tokens)
 ```
+
+Token estimates are deliberately rough (`size_bytes / ratio_for_extension`) — use them to pick the cheaper file when several would do, not as exact counts.
 
 ### Index status
 ```bash

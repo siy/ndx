@@ -153,7 +153,9 @@ fn dispatch(req: Request, index: &Index) -> Response {
             let path = req.params.get("path").and_then(|v| v.as_str());
             let pattern = req.params.get("pattern").and_then(|v| v.as_str());
             let sort = req.params.get("sort").and_then(|v| v.as_str());
-            match server::list_files(index, path, pattern, sort) {
+            let tokens = req.params.get("tokens").and_then(|v| v.as_bool()).unwrap_or(false);
+            let json = req.params.get("json").and_then(|v| v.as_bool()).unwrap_or(false);
+            match server::list_files(index, path, pattern, sort, tokens, json) {
                 Ok(r) => Response::ok(r),
                 Err(e) => Response::err(e),
             }
@@ -164,7 +166,9 @@ fn dispatch(req: Request, index: &Index) -> Response {
                 None => return Response::err("missing 'pattern'".to_string()),
             };
             let sort = req.params.get("sort").and_then(|v| v.as_str());
-            match server::search_files(index, pattern, sort) {
+            let tokens = req.params.get("tokens").and_then(|v| v.as_bool()).unwrap_or(false);
+            let json = req.params.get("json").and_then(|v| v.as_bool()).unwrap_or(false);
+            match server::search_files(index, pattern, sort, tokens, json) {
                 Ok(r) => Response::ok(r),
                 Err(e) => Response::err(e),
             }
