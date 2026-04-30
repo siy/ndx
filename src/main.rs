@@ -433,6 +433,17 @@ fn cmd_hook() -> Result<()> {
             }
             _ => {}
         }
+
+        // PreToolUse on Read: emit the repeat-read nudge (if any) and
+        // record the event for the next iteration. Short-circuit before
+        // the Bash flow — Read events have nothing to do with manifest
+        // lookups or wake-up injection.
+        if hi.hook_event_name.as_deref() == Some("PreToolUse")
+            && hi.tool_name.as_deref() == Some("Read")
+        {
+            handle_read_hook(hi);
+            return Ok(());
+        }
     }
 
     // Phase A/B: manifest-driven hook response.
@@ -475,6 +486,7 @@ fn cmd_hook() -> Result<()> {
                     command: recall::safe_prefix(command, 500).to_string(),
                     manifest_key,
                     ingested_at: chrono::Utc::now().to_rfc3339(),
+                    meta: None,
                 };
                 let _ = mem.insert_event(&entry);
             }
@@ -706,6 +718,88 @@ fn pending_hygiene_counts(palace: &Palace) -> Result<(usize, usize, usize, usize
 
 /// SessionEnd hook handler. Observational — no JSON output, exit 0.
 ///
+/// Repeated-read detection. Fires before every Read tool invocation.
+///
+/// Captures the file's current `mtime` and counts past Read events for
+/// the same `(session_id, file_path, mtime)` tuple. Two prior reads of
+/// identical content (i.e. no Edit/Write bumped mtime in between)
+/// means the upcoming read would be the third — emit an
+/// `additionalContext` nudge so Claude works from existing context
+/// instead of paying the read cost again. Then log the event so the
+/// next call can see this read.
+///
+/// Soft-fails on every error: missing file, unreadable metadata,
+/// memory DB unavailable. Read-only side effects from Claude's
+/// perspective; we never block or rewrite the read.
+const REPEAT_READ_THRESHOLD: usize = 2;
+
+fn handle_read_hook(hi: &hook::HookInput) {
+    let path = match hi
+        .tool_input
+        .as_ref()
+        .and_then(|ti| ti.file_path.as_deref())
+    {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => return,
+    };
+    let session_id = hi.session_id.clone().unwrap_or_default();
+    if session_id.is_empty() {
+        return;
+    }
+
+    let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+        Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs().to_string(),
+            Err(_) => return,
+        },
+        Err(_) => return, // file gone / not readable; let Claude's Read fail naturally
+    };
+
+    let mem = match MemoryIndex::open() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    let count = mem
+        .count_session_reads(&session_id, &path, &mtime)
+        .unwrap_or(0);
+
+    // Emit nudge before logging this read — count reflects past reads
+    // only, so threshold==2 means the *next* (current) read is the 3rd.
+    if count >= REPEAT_READ_THRESHOLD {
+        let msg = format!(
+            "ndx: this session has read {} {} times — work from existing context instead of re-reading",
+            path,
+            count
+        );
+        let out = hook::HookOutput {
+            hook_specific_output: hook::HookSpecificOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: "allow".to_string(),
+                additional_context: Some(msg),
+                updated_input: None,
+            },
+        };
+        if let Ok(json) = serde_json::to_string(&out) {
+            println!("{}", json);
+        }
+    }
+
+    // Best-effort log — failures here only mean future hooks may
+    // miscount, never break the current Read.
+    let entry = memory::EventEntry {
+        event_ts: chrono::Utc::now().to_rfc3339(),
+        session_id,
+        project_dir: hi.cwd.clone().unwrap_or_default(),
+        tool: "Read".to_string(),
+        command: path,
+        manifest_key: None,
+        ingested_at: chrono::Utc::now().to_rfc3339(),
+        meta: Some(mtime),
+    };
+    let _ = mem.insert_event(&entry);
+}
+
 /// Mines the just-ended session into the palace (raw, no embed). Reuses
 /// `MINED_SESSIONS` for idempotency: if the session was already mined
 /// (e.g. an earlier SessionStart already covered it), this becomes a

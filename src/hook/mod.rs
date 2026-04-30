@@ -46,7 +46,12 @@ pub struct HookInput {
 
 #[derive(Debug, Deserialize)]
 pub struct ToolInput {
+    /// Bash tool: the command line to run.
     pub command: Option<String>,
+    /// Read tool: the absolute path the tool will open. Captured for
+    /// repeated-read detection; `None` for other tools.
+    #[serde(default)]
+    pub file_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

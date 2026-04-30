@@ -21,6 +21,8 @@ The palace is **mined automatically** by the SessionStart and SessionEnd hooks; 
 
 If a SessionStart nudge appears in your context (`# ndx-recall — palace hygiene pending`), that's the harness telling you the backlog crossed the threshold — run `/ndx-chore`.
 
+If a Read nudge appears in your context (`ndx: this session has read <path> N times — work from existing context instead of re-reading`), the file you're about to open hasn't changed since the last two reads. Use what you already have unless you have a specific reason to re-fetch (e.g. a tool-driven edit you need to verify).
+
 ## When to reach for the CLI directly
 
 - **Content search across many files** — faster than grep for large codebases due to the trigram index
@@ -926,19 +928,22 @@ fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
     if let Some(hooks_obj) = hooks.as_object_mut() {
-        // ── PreToolUse (Bash) ─────────────────────────────────────────
+        // ── PreToolUse (Bash + Read) ──────────────────────────────────
+        // Two matchers, two ndx entries: Bash drives manifest lookup +
+        // wake-up injection, Read drives repeated-read detection.
         let pre_tool_use = hooks_obj
             .entry("PreToolUse")
             .or_insert_with(|| serde_json::json!([]));
 
         if let Some(arr) = pre_tool_use.as_array_mut() {
-            // Remove existing kcp-commands or ndx entries
+            // Strip every existing Bash- or Read-matched entry whose
+            // command mentions kcp or ndx — covers in-place upgrades
+            // and the historical kcp-commands hook.
             arr.retain(|entry| {
                 let matcher = entry.get("matcher").and_then(|v| v.as_str());
-                if matcher != Some("Bash") {
+                if !matches!(matcher, Some("Bash") | Some("Read")) {
                     return true;
                 }
-                // Check if it's a kcp or ndx hook
                 if let Some(hooks_arr) = entry.get("hooks").and_then(|v| v.as_array()) {
                     for h in hooks_arr {
                         if let Some(cmd) = h.get("command").and_then(|v| v.as_str()) {
@@ -951,7 +956,7 @@ fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()
                 true
             });
 
-            // Add ndx hook
+            // Bash matcher
             arr.push(serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{
@@ -959,6 +964,17 @@ fn register_claude_settings(settings_path: &PathBuf, ndx_bin: &str) -> Result<()
                     "command": format!("{} hook", ndx_bin),
                     "timeout": 10,
                     "statusMessage": "ndx: looking up command manifest..."
+                }]
+            }));
+
+            // Read matcher (repeated-read detection)
+            arr.push(serde_json::json!({
+                "matcher": "Read",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{} hook", ndx_bin),
+                    "timeout": 10,
+                    "statusMessage": "ndx: checking repeated-read state..."
                 }]
             }));
         }
@@ -1033,11 +1049,19 @@ mod tests {
                     .unwrap_or(false)
             })
             .collect();
+        // One ndx entry per matcher (Bash + Read); idempotent across
+        // installs — neither matcher gets duplicated.
         assert_eq!(
             ndx_pre_tool.len(),
-            1,
-            "PreToolUse should have exactly one ndx entry after two installs"
+            2,
+            "PreToolUse should have exactly two ndx entries (Bash + Read) after two installs"
         );
+        let matchers: std::collections::BTreeSet<&str> = ndx_pre_tool
+            .iter()
+            .filter_map(|e| e.get("matcher").and_then(|v| v.as_str()))
+            .collect();
+        assert!(matchers.contains("Bash"));
+        assert!(matchers.contains("Read"));
 
         let pre_compact = v
             .pointer("/hooks/PreCompact")

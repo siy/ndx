@@ -70,6 +70,14 @@ pub struct EventEntry {
     pub command: String,
     pub manifest_key: Option<String>,
     pub ingested_at: String,
+    /// Free-form auxiliary string for tool-specific state. For
+    /// `tool="Read"`, this carries the file's `mtime` (unix seconds, as
+    /// string) at the moment the read fired — used by repeated-read
+    /// detection to distinguish "same content read again" from "file
+    /// changed and re-read." Older events lack this field; serde's
+    /// default keeps them deserializable.
+    #[serde(default)]
+    pub meta: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,8 +125,14 @@ pub struct MemoryIndex {
 
 impl MemoryIndex {
     pub fn open() -> Result<Self> {
-        let dir = Self::db_dir()?;
-        std::fs::create_dir_all(&dir)?;
+        Self::open_at(&Self::db_dir()?)
+    }
+
+    /// Open (or create) a memory database under `dir`. Test-friendly
+    /// variant of `open` that doesn't depend on `$HOME`. The on-disk
+    /// file is `<dir>/memory.redb`.
+    pub fn open_at(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
         let db_path = dir.join("memory.redb");
         let db = Database::create(&db_path).context("failed to open memory database")?;
 
@@ -589,6 +603,41 @@ impl MemoryIndex {
         Ok(table.get(0u8)?.map(|v| v.value()).unwrap_or(0))
     }
 
+    /// Count past `Read` events in a session that targeted the same
+    /// `path` and observed the same `mtime`. Used by repeated-read
+    /// detection to decide whether the upcoming Read is redundant
+    /// (same content, no edits between). A bumped mtime — whether
+    /// from Claude's own Edit/Write or an external change — drops the
+    /// event from the count.
+    ///
+    /// `mtime` is compared as the same string written by the hook
+    /// (unix seconds, base 10), avoiding any parsing in the hot path.
+    pub fn count_session_reads(
+        &self,
+        session_id: &str,
+        path: &str,
+        mtime: &str,
+    ) -> Result<usize> {
+        let txn = self.db.begin_read()?;
+        let events = txn.open_table(EVENTS)?;
+        let mut count = 0usize;
+        for entry in events.range::<u64>(..)? {
+            let (_, data) = entry?;
+            let ev: EventEntry = match serde_json::from_slice(data.value()) {
+                Ok(e) => e,
+                Err(_) => continue, // skip unparseable rows
+            };
+            if ev.tool == "Read"
+                && ev.session_id == session_id
+                && ev.command == path
+                && ev.meta.as_deref() == Some(mtime)
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn set_event_cursor(&self, offset: u64) -> Result<()> {
         let txn = self.db.begin_write()?;
         {
@@ -757,5 +806,70 @@ impl MemoryIndex {
             Some(entry) => Ok(entry.files),
             None => Ok(Vec::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_read_event(session: &str, path: &str, mtime: &str, ts_seq: u64) -> EventEntry {
+        EventEntry {
+            event_ts: format!("2026-04-30T12:00:{:02}.000Z", ts_seq),
+            session_id: session.to_string(),
+            project_dir: "/tmp/p".to_string(),
+            tool: "Read".to_string(),
+            command: path.to_string(),
+            manifest_key: None,
+            ingested_at: format!("2026-04-30T12:00:{:02}.000Z", ts_seq),
+            meta: Some(mtime.to_string()),
+        }
+    }
+
+    #[test]
+    fn count_session_reads_matches_session_path_and_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = MemoryIndex::open_at(tmp.path()).unwrap();
+
+        mem.insert_event(&make_read_event("S1", "/a.rs", "100", 1)).unwrap();
+        mem.insert_event(&make_read_event("S1", "/a.rs", "100", 2)).unwrap();
+        // Different session — must not count.
+        mem.insert_event(&make_read_event("S2", "/a.rs", "100", 3)).unwrap();
+        // Different path — must not count.
+        mem.insert_event(&make_read_event("S1", "/b.rs", "100", 4)).unwrap();
+        // Different mtime (file was edited between reads) — must not count.
+        mem.insert_event(&make_read_event("S1", "/a.rs", "200", 5)).unwrap();
+
+        let n = mem.count_session_reads("S1", "/a.rs", "100").unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn count_session_reads_ignores_bash_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = MemoryIndex::open_at(tmp.path()).unwrap();
+
+        let bash = EventEntry {
+            event_ts: "2026-04-30T12:00:01.000Z".to_string(),
+            session_id: "S1".to_string(),
+            project_dir: "/tmp/p".to_string(),
+            tool: "Bash".to_string(),
+            command: "/a.rs".to_string(),
+            manifest_key: None,
+            ingested_at: "2026-04-30T12:00:01.000Z".to_string(),
+            meta: Some("100".to_string()),
+        };
+        mem.insert_event(&bash).unwrap();
+        mem.insert_event(&make_read_event("S1", "/a.rs", "100", 2)).unwrap();
+
+        // Only the Read event counts; Bash with the same key does not.
+        assert_eq!(mem.count_session_reads("S1", "/a.rs", "100").unwrap(), 1);
+    }
+
+    #[test]
+    fn count_session_reads_returns_zero_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = MemoryIndex::open_at(tmp.path()).unwrap();
+        assert_eq!(mem.count_session_reads("S1", "/a.rs", "100").unwrap(), 0);
     }
 }

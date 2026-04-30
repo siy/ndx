@@ -11,7 +11,7 @@ Fast file index with trigram search, real-time file watching, episodic memory, *
 - **Episodic memory** — indexes AI coding session transcripts for full-text search across past sessions
 - **Recall palace** — per-project structured memory with rooms, drawers, 4-layer retrieval ladder (identity → wake-up → room-filtered → hybrid search), local embeddings via `fastembed` + `all-MiniLM-L6-v2`
 - **Hybrid search** — semantic (cosine) + lexical (BM25) fused via RRF; wins over either alone on both exact identifiers and synonyms
-- **Command hooks** — PreToolUse hook injects CLI syntax hints, filters noisy output, and auto-injects wake-up context once per Claude session; PreCompact hook re-injects wake-up before context compaction so palace context survives `/compact`
+- **Command hooks** — PreToolUse on Bash injects CLI syntax hints, filters noisy output, logs events, and auto-injects wake-up context once per Claude session; PreToolUse on Read flags repeated reads of the same `(path, mtime)` so Claude works from existing context instead of re-reading; PreCompact re-injects wake-up before context compaction; SessionStart/SessionEnd auto-mine the palace
 - **Cross-referencing** — bridges file index, session memory, and recall palace ("which drawers touched this file?", "which drawers came from this commit?")
 - **Subagent-friendly** — pure CLI interface works from any context, including Claude Code subagents and team members
 - **Claude-curated quality** — five slash commands (`/ndx-recall-classify`, `-score`, `-dedupe`, `-contradict`, `-summarize`) delegate judgment work to Claude instead of brittle heuristics
@@ -274,13 +274,15 @@ ndx init [path] [--clean-up]            # wire ndx into a project (CLAUDE.md, .g
 
 ## Command Hook
 
-ndx registers two Claude Code hooks on `ndx install`. The PreToolUse Bash hook runs three phases for every Bash command (below); the PreCompact hook re-injects the L0+L1 recall-palace wake-up text before context compaction (manual `/compact` or automatic).
+ndx registers four Claude Code hooks on `ndx install`: PreToolUse on `Bash` (manifest lookup + wake-up), PreToolUse on `Read` (repeated-read detection), PreCompact (re-inject wake-up before context compaction), SessionStart and SessionEnd (auto-mining).
 
-**Phase A — Syntax injection:** Before execution, injects CLI syntax hints (key flags, preferred invocations) from YAML manifests into the agent's context.
+**PreToolUse Bash — Phase A — Syntax injection:** Before execution, injects CLI syntax hints (key flags, preferred invocations) from YAML manifests into the agent's context.
 
-**Phase B — Output filtering:** Pipes output through noise filters (regex patterns) and truncation (max lines), reducing context window usage.
+**PreToolUse Bash — Phase B — Output filtering:** Pipes output through noise filters (regex patterns) and truncation (max lines), reducing context window usage.
 
-**Phase C — Event logging:** Records every command directly to the memory database for cross-session search.
+**PreToolUse Bash — Phase C — Event logging:** Records every command directly to the memory database for cross-session search.
+
+**PreToolUse Read — Repeated-read detection:** Captures the file's `mtime` at hook time and counts past Read events for the same `(session, path, mtime)`. When the upcoming Read would be the third of identical content (no Edit or Write bumped `mtime` between reads), emits an `additionalContext` line: `ndx: this session has read <path> N times — work from existing context instead of re-reading`. An external or Claude-driven edit changes `mtime` and resets the count automatically.
 
 ### Manifest format
 

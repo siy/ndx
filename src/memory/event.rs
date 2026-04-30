@@ -87,6 +87,7 @@ pub fn ingest_events(memory: &MemoryIndex) -> Result<EventScanResult> {
             },
             manifest_key,
             ingested_at: chrono::Utc::now().to_rfc3339(),
+            meta: None,
         };
 
         match memory.insert_event(&entry) {
