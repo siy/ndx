@@ -163,8 +163,9 @@ ndx xref git <commit>                    # drawers referencing files changed in 
 
 ```bash
 ndx scan              # re-scan project index + memory database
-ndx install           # download command manifests, register hook + skill
-ndx init              # install ndx skills into current project
+ndx install           # download command manifests, register hooks, install global slash commands to ~/.claude/commands/
+ndx init              # wire ndx into the current project (CLAUDE.md, .gitignore); slash commands stay global
+ndx init --clean-up   # also remove any pre-existing project-local skill copies (refuses git-tracked files; prints `git rm` hint)
 ndx recall reembed    # backfill embeddings (downloads model if needed)
 ndx recall rebuild-index  # re-tokenize all drawers into BM25 (v1→v2) and stamp canonical_root + normalize source_file paths (v2→v3)
 ```
@@ -595,7 +596,7 @@ pub fn run_install() -> Result<()> {
         settings_path.display()
     );
 
-    // 4. Install global skills (main ndx.md + 5 recall slash commands)
+    // 4. Install global skills (main ndx.md + recall slash commands)
     let skill_dir = home.join(".claude").join("commands");
     install_skill(&skill_dir)?;
     eprintln!(
@@ -604,6 +605,12 @@ pub fn run_install() -> Result<()> {
         skill_dir.display()
     );
 
+    // 5. Remove obsolete skills left behind by older ndx versions.
+    let pruned = prune_global_orphans(&skill_dir)?;
+    for name in &pruned {
+        eprintln!("  Removed obsolete skill: {}", name);
+    }
+
     eprintln!();
     eprintln!("ndx install complete");
     eprintln!("  Restart Claude Code to activate.");
@@ -611,13 +618,108 @@ pub fn run_install() -> Result<()> {
     Ok(())
 }
 
-/// Install the ndx skill into a specific project directory.
+/// Wire ndx into a project. Slash commands themselves are not copied
+/// here — they live globally in `~/.claude/commands/` (installed by
+/// `ndx install`) and are visible to every project Claude Code opens.
+/// This function only touches per-project files: the `.gitignore`
+/// entry for `.ndx/` and the `## ndx` section in `CLAUDE.md`.
 pub fn install_skill_to_project(project_dir: &Path) -> Result<()> {
-    let skill_dir = project_dir.join(".claude").join("commands");
-    install_skill(&skill_dir)?;
     ensure_gitignore_entry(project_dir)?;
     ensure_claude_md_ndx_section(project_dir)?;
     Ok(())
+}
+
+/// Files that ndx wrote to `<project>/.claude/commands/` in older
+/// versions before slash commands were standardized as global-only.
+/// `cleanup_project_skills` removes these from a project on demand.
+/// User-authored files that happen to share the `ndx-` prefix are
+/// untouched — only canonical names appear in this list.
+pub const OBSOLETE_SKILLS: &[&str] = &["ndx-recall-refresh.md"];
+
+/// Result of `cleanup_project_skills`: which canonical skill copies
+/// were removed and which were preserved because git tracks them.
+#[derive(Debug, Default)]
+pub struct CleanupReport {
+    pub removed: Vec<PathBuf>,
+    pub needs_git_rm: Vec<PathBuf>,
+    pub dir_removed: bool,
+}
+
+/// Returns true iff `path` (relative or absolute) is tracked by git
+/// in the repository at `project_dir`. If `project_dir` is not a git
+/// working tree, returns false (callers treat untracked-file as
+/// "safe to remove").
+fn is_git_tracked(project_dir: &Path, path: &Path) -> bool {
+    let rel = path.strip_prefix(project_dir).unwrap_or(path);
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_dir)
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg(rel)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    matches!(status, Ok(s) if s.success())
+}
+
+/// Remove `<project>/.claude/commands/<canonical>` for every canonical
+/// skill file (current `SKILL_FILES` plus historical `OBSOLETE_SKILLS`),
+/// refusing to touch git-tracked files. Foreign files in the directory
+/// are preserved. The directory itself is removed if empty afterwards.
+pub fn cleanup_project_skills(project_dir: &Path) -> Result<CleanupReport> {
+    let mut report = CleanupReport::default();
+    let cmd_dir = project_dir.join(".claude").join("commands");
+    if !cmd_dir.exists() {
+        return Ok(report);
+    }
+
+    let canonical: Vec<&str> = SKILL_FILES
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(OBSOLETE_SKILLS.iter().copied())
+        .collect();
+
+    for name in canonical {
+        let path = cmd_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        if is_git_tracked(project_dir, &path) {
+            report.needs_git_rm.push(path);
+        } else {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing {}", path.display()))?;
+            report.removed.push(path);
+        }
+    }
+
+    // Remove `.claude/commands/` if it's now empty. Leave `.claude/`
+    // alone — other tools may use it.
+    if let Ok(mut entries) = std::fs::read_dir(&cmd_dir) {
+        if entries.next().is_none() {
+            std::fs::remove_dir(&cmd_dir).ok();
+            report.dir_removed = true;
+        }
+    }
+
+    Ok(report)
+}
+
+/// Remove any obsolete canonical skills from the global directory.
+/// Unconditional and idempotent — runs every time `ndx install` is
+/// invoked. Returns the list of names that were actually removed.
+pub fn prune_global_orphans(skill_dir: &Path) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for name in OBSOLETE_SKILLS {
+        let path = skill_dir.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing {}", path.display()))?;
+            removed.push((*name).to_string());
+        }
+    }
+    Ok(removed)
 }
 
 const CLAUDE_MD_NDX_SECTION: &str = r#"
@@ -1036,5 +1138,196 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Project-side install: skills no longer copied ─────────────────
+
+    /// `install_skill_to_project` must NOT create
+    /// `<project>/.claude/commands/`. It only touches CLAUDE.md and
+    /// .gitignore.
+    #[test]
+    fn init_does_not_create_skill_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_skill_to_project(tmp.path()).unwrap();
+
+        let cmd_dir = tmp.path().join(".claude").join("commands");
+        assert!(
+            !cmd_dir.exists(),
+            ".claude/commands/ should not be created by ndx init"
+        );
+
+        let claude_md = tmp.path().join("CLAUDE.md");
+        assert!(claude_md.exists(), "CLAUDE.md must be created");
+        let body = std::fs::read_to_string(&claude_md).unwrap();
+        assert!(body.contains("## ndx"));
+
+        let gi = tmp.path().join(".gitignore");
+        assert!(gi.exists(), ".gitignore must be created");
+        let gibody = std::fs::read_to_string(&gi).unwrap();
+        assert!(gibody.lines().any(|l| l.trim() == ".ndx/"));
+    }
+
+    // ── Project-side cleanup ──────────────────────────────────────────
+
+    fn write_dummy(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// `cleanup_project_skills` removes canonical names but preserves
+    /// foreign files. Directory survives because of the foreign file.
+    #[test]
+    fn cleanup_removes_canonical_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = tmp.path().join(".claude").join("commands");
+        write_dummy(&cmd.join("ndx.md"), "stale");
+        write_dummy(&cmd.join("ndx-chore.md"), "stale");
+        write_dummy(&cmd.join("foo.md"), "user file");
+
+        let report = cleanup_project_skills(tmp.path()).unwrap();
+
+        assert_eq!(report.removed.len(), 2);
+        assert!(report.needs_git_rm.is_empty());
+        assert!(!report.dir_removed);
+        assert!(!cmd.join("ndx.md").exists());
+        assert!(!cmd.join("ndx-chore.md").exists());
+        assert!(cmd.join("foo.md").exists());
+    }
+
+    /// Cleanup removes the directory when nothing remains after pruning
+    /// canonical files.
+    #[test]
+    fn cleanup_removes_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = tmp.path().join(".claude").join("commands");
+        write_dummy(&cmd.join("ndx.md"), "stale");
+        write_dummy(&cmd.join("ndx-recall-handover.md"), "stale");
+
+        let report = cleanup_project_skills(tmp.path()).unwrap();
+
+        assert!(report.dir_removed, "empty .claude/commands/ should be removed");
+        assert!(!cmd.exists(), "directory must be gone");
+        // .claude/ itself should remain.
+        assert!(tmp.path().join(".claude").exists());
+    }
+
+    /// Missing `.claude/commands/` is a no-op.
+    #[test]
+    fn cleanup_handles_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = cleanup_project_skills(tmp.path()).unwrap();
+        assert!(report.removed.is_empty());
+        assert!(report.needs_git_rm.is_empty());
+        assert!(!report.dir_removed);
+    }
+
+    /// Cleanup also targets the historical orphan `ndx-recall-refresh.md`
+    /// even though it's not in the current `SKILL_FILES`.
+    #[test]
+    fn cleanup_removes_obsolete_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = tmp.path().join(".claude").join("commands");
+        write_dummy(&cmd.join("ndx-recall-refresh.md"), "stale");
+
+        let report = cleanup_project_skills(tmp.path()).unwrap();
+
+        assert_eq!(report.removed.len(), 1);
+        assert!(!cmd.join("ndx-recall-refresh.md").exists());
+    }
+
+    /// Git-tracked canonical files are preserved and reported as
+    /// `needs_git_rm`. Skipped if `git` is not on PATH.
+    #[test]
+    fn cleanup_refuses_git_tracked() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("git not available — skipping");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {:?} failed", args);
+        };
+
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+
+        let cmd = path.join(".claude").join("commands");
+        write_dummy(&cmd.join("ndx.md"), "tracked");
+        write_dummy(&cmd.join("ndx-chore.md"), "untracked");
+        run_git(&["add", ".claude/commands/ndx.md"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+
+        let report = cleanup_project_skills(path).unwrap();
+
+        assert_eq!(
+            report.removed.len(),
+            1,
+            "untracked file should have been removed"
+        );
+        assert!(!cmd.join("ndx-chore.md").exists());
+        assert_eq!(
+            report.needs_git_rm.len(),
+            1,
+            "tracked file should be flagged"
+        );
+        assert!(cmd.join("ndx.md").exists());
+        assert!(report.needs_git_rm[0].ends_with("ndx.md"));
+    }
+
+    // ── Global-side orphan janitor ────────────────────────────────────
+
+    #[test]
+    fn prune_orphans_removes_recall_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ndx-recall-refresh.md"), "stale").unwrap();
+
+        let removed = prune_global_orphans(tmp.path()).unwrap();
+
+        assert_eq!(removed, vec!["ndx-recall-refresh.md".to_string()]);
+        assert!(!tmp.path().join("ndx-recall-refresh.md").exists());
+    }
+
+    #[test]
+    fn prune_orphans_preserves_user_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("my-custom.md"), "mine").unwrap();
+        std::fs::write(tmp.path().join("ndx-recall-handover.md"), "current").unwrap();
+
+        let removed = prune_global_orphans(tmp.path()).unwrap();
+
+        assert!(removed.is_empty());
+        assert!(tmp.path().join("my-custom.md").exists());
+        assert!(tmp.path().join("ndx-recall-handover.md").exists());
+    }
+
+    #[test]
+    fn prune_orphans_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ndx-recall-refresh.md"), "stale").unwrap();
+
+        let first = prune_global_orphans(tmp.path()).unwrap();
+        let second = prune_global_orphans(tmp.path()).unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
     }
 }

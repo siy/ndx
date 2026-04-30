@@ -71,7 +71,9 @@ fn print_usage() {
     eprintln!("  ndx hook                 PreToolUse hook handler (stdin/stdout)");
     eprintln!("  ndx filter <key>         Output noise filter (stdin/stdout)");
     eprintln!("  ndx install              Download manifests, register hook + skill");
-    eprintln!("  ndx init [path]          Install ndx skill into a project");
+    eprintln!("  ndx init [path] [--clean-up]");
+    eprintln!("                           Wire ndx into a project (CLAUDE.md, .gitignore).");
+    eprintln!("                           --clean-up removes pre-existing project-local skill copies.");
     eprintln!("  ndx help                 Show this help message");
 }
 
@@ -773,14 +775,43 @@ fn cmd_scan() -> Result<()> {
     Ok(())
 }
 
-fn cmd_init(dir: PathBuf) -> Result<()> {
+fn cmd_init(dir: PathBuf, clean_up: bool) -> Result<()> {
     let dir = dir.canonicalize().context("invalid directory path")?;
     install::install_skill_to_project(&dir)?;
     eprintln!(
-        "ndx skills ({} files) installed to {}/.claude/commands/",
-        install::SKILL_FILES.len(),
+        "ndx project hooks installed in {}: CLAUDE.md updated, .gitignore updated",
         dir.display()
     );
+
+    if clean_up {
+        let report = install::cleanup_project_skills(&dir)?;
+        for path in &report.removed {
+            let rel = path.strip_prefix(&dir).unwrap_or(path);
+            eprintln!("  Removed: {}", rel.display());
+        }
+        if report.dir_removed {
+            eprintln!("  Removed empty directory: .claude/commands/");
+        }
+        if !report.needs_git_rm.is_empty() {
+            eprintln!();
+            eprintln!("Refusing to remove git-tracked files. Run:");
+            let rels: Vec<String> = report
+                .needs_git_rm
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&dir)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            eprintln!("  git rm {}", rels.join(" "));
+            eprintln!("then commit the removal.");
+        }
+        if report.removed.is_empty() && report.needs_git_rm.is_empty() {
+            eprintln!("  No project-local skill files found — nothing to clean up.");
+        }
+    }
     Ok(())
 }
 
@@ -1937,11 +1968,18 @@ fn dispatch(args: &[String]) -> Result<()> {
         Some("scan") => cmd_scan(),
         Some("install") => install::run_install(),
         Some("init") => {
-            let dir = args
-                .get(1)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            cmd_init(dir)
+            let mut clean_up = false;
+            let mut dir: Option<PathBuf> = None;
+            for a in &args[1..] {
+                match a.as_str() {
+                    "--clean-up" => clean_up = true,
+                    other if !other.starts_with("--") && dir.is_none() => {
+                        dir = Some(PathBuf::from(other));
+                    }
+                    other => anyhow::bail!("unknown argument to init: {}", other),
+                }
+            }
+            cmd_init(dir.unwrap_or_else(|| PathBuf::from(".")), clean_up)
         }
 
         Some("--version" | "-V" | "version") => {

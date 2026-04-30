@@ -1,6 +1,12 @@
 # Changelog
 
-## v0.8.1 — Unreleased
+## v0.8.2 — Unreleased
+
+- **Slash commands now live globally only.** `ndx init` no longer copies skill files into `<project>/.claude/commands/`; it only appends the `## ndx` section to `CLAUDE.md` and adds `.ndx/` to `.gitignore`. The eight canonical skills (`ndx.md`, `ndx-chore.md`, six `ndx-recall-*`) continue to be written to `~/.claude/commands/` by `ndx install`. Slash commands are pure CLI documentation — one source of truth eliminates per-project drift.
+- **`ndx init --clean-up`** removes pre-existing copies of the canonical skill set (plus the historical orphan `ndx-recall-refresh.md`) from `<project>/.claude/commands/`. Files tracked by git are preserved with an instruction to run `git rm <paths>` manually. Non-canonical files (e.g. user-authored slash commands sharing the `ndx-` prefix) are not touched. The `.claude/commands/` directory is removed when empty.
+- **`ndx install` now prunes obsolete global skills.** `ndx-recall-refresh.md` is removed unconditionally if present in `~/.claude/commands/`. Idempotent — silent when already absent.
+
+## v0.8.1 — 2026-04-29
 
 - New `/ndx-chore` orchestrator skill that walks the four palace-hygiene phases — classify, score, dedupe, contradict — to completion in one go, with concise per-phase judgment floors and a single review-needed total. The `/ndx` skill has been rewritten around lifecycle (daily/session-end/occasional/surgical) instead of a CLI-reference dump; the full reference is preserved under a `Reference` heading.
 - SessionEnd hook auto-mines the just-ended session into the palace (`mine --from-memory` scoped to the ending `session_id`, no embed). Observational — emits no `additionalContext`. Soft-fails when there is no palace rooted at `cwd`. Idempotent via the existing `MINED_SESSIONS` table.

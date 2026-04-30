@@ -69,9 +69,11 @@ ndx install
 
 ```sh
 cd /path/to/your/project
-ndx init                    # installs 7 skill files + .gitignore + CLAUDE.md ndx section
+ndx init                    # adds .ndx/ to .gitignore, appends ## ndx section to CLAUDE.md
 ndx recall init             # creates the recall palace (.ndx/recall.redb)
 ```
+
+Slash commands (`/ndx`, `/ndx-chore`, `/ndx-recall-*`) live globally in `~/.claude/commands/` after `ndx install` and are visible from every project Claude Code opens — `ndx init` does not copy them per-project. If you have an older project with stale per-project copies (from before this changed), run `ndx init --clean-up` to remove them; git-tracked copies are preserved with an explicit `git rm` instruction.
 
 ## Recall Palace Workflow
 
@@ -259,8 +261,9 @@ ndx stop                                # stop the background daemon
 
 ```sh
 ndx scan                                # scan memory (sessions, events, agents)
-ndx install                             # download manifests, register hook + skill
-ndx init [path]                         # install ndx skill into a project
+ndx install                             # download manifests, register hooks, install global skills
+ndx init [path] [--clean-up]            # wire ndx into a project (CLAUDE.md, .gitignore)
+                                        # --clean-up removes pre-existing project-local skill copies
 ```
 
 ## Command Hook
