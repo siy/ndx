@@ -625,7 +625,7 @@ pub fn run_install() -> Result<()> {
     let settings_path = home.join(".claude").join("settings.json");
     register_claude_settings(&settings_path, &ndx_bin_str)?;
     eprintln!(
-        "  Hook: PreToolUse (Bash), PreCompact, SessionStart, SessionEnd registered in {}",
+        "  Hooks: PreToolUse (Bash + Read), PreCompact, SessionStart, SessionEnd registered in {}",
         settings_path.display()
     );
 
