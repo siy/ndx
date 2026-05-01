@@ -68,6 +68,8 @@ fn print_usage() {
     eprintln!("  ndx ping                 Check if daemon is running");
     eprintln!();
     eprintln!("Other commands:");
+    eprintln!("  ndx issue <add|list|show|close|reopen|update|rm|milestones>");
+    eprintln!("                           Per-project issue tracker (drawers in `_issues_`)");
     eprintln!("  ndx scan                 Scan memory (sessions, events, agents)");
     eprintln!("  ndx hook                 PreToolUse hook handler (stdin/stdout)");
     eprintln!("  ndx filter <key>         Output noise filter (stdin/stdout)");
@@ -387,6 +389,244 @@ fn render_drawer_hits(hits: &[recall::Drawer], json: bool) -> Result<()> {
 }
 
 // ── Hook/filter commands ──
+
+/// Top-level issue tracker dispatcher. Issues live in the recall
+/// palace's reserved `_issues_` room (see `recall::issue`); this
+/// function wires the user-facing CLI to those primitives.
+fn cmd_issue(args: &[String]) -> Result<()> {
+    use recall::issue;
+
+    let sub = args.first().map(|s| s.as_str());
+    let sub_args: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
+
+    match sub {
+        Some("add") => {
+            let title = get_positional(
+                sub_args,
+                &[
+                    "--body",
+                    "--milestone",
+                    "--importance",
+                    "--source-file",
+                    "--link-drawer",
+                ],
+            )
+            .ok_or_else(|| {
+                RecallError::usage(
+                    "usage: ndx issue add \"title\" [--body B] [--milestone M] [--importance N] [--source-file F] [--link-drawer N]",
+                )
+            })?;
+            let body = get_flag(sub_args, "--body");
+            let milestone = get_flag(sub_args, "--milestone");
+            let importance = get_flag_usize(sub_args, "--importance")
+                .map(|n| n as u8)
+                .unwrap_or(recall::DEFAULT_IMPORTANCE);
+            let source_file = get_flag(sub_args, "--source-file");
+            let mut link_drawers = Vec::new();
+            for w in sub_args.windows(2) {
+                if w[0] == "--link-drawer" {
+                    if let Ok(n) = w[1].parse::<u64>() {
+                        link_drawers.push(n);
+                    }
+                }
+            }
+
+            let palace = Palace::open_from_cwd()?;
+            let outcome = issue::add(
+                &palace,
+                issue::AddOptions {
+                    title,
+                    body,
+                    milestone,
+                    importance,
+                    source_file,
+                    link_drawers: &link_drawers,
+                },
+            )?;
+            if has_flag(sub_args, "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "id": outcome.id,
+                        "status": "open",
+                        "milestone": milestone,
+                    }))?
+                );
+            } else {
+                eprintln!("issue {} filed", outcome.id);
+            }
+            Ok(())
+        }
+
+        Some("list") => {
+            let status = match get_flag(sub_args, "--status") {
+                None => issue::StatusFilter::Open,
+                Some(s) => issue::StatusFilter::parse(s).ok_or_else(|| {
+                    RecallError::usage("--status must be one of: open|closed|all")
+                })?,
+            };
+            let milestone = get_flag(sub_args, "--milestone");
+            let palace = Palace::open_from_cwd()?;
+            let issues = issue::list(&palace, status, milestone)?;
+
+            if has_flag(sub_args, "--json") {
+                println!("{}", serde_json::to_string_pretty(&issues)?);
+                return Ok(());
+            }
+            if issues.is_empty() {
+                println!("(no issues)");
+                return Ok(());
+            }
+            for d in &issues {
+                let st = issue::drawer_status(d);
+                let ms = d
+                    .metadata
+                    .get(issue::META_MILESTONE)
+                    .map(|s| s.as_str())
+                    .unwrap_or("-");
+                let title = d.text.lines().next().unwrap_or("(untitled)");
+                println!(
+                    "#{:<5} [{}] imp={} m={} — {}",
+                    d.id, st, d.importance, ms, title
+                );
+            }
+            Ok(())
+        }
+
+        Some("show") => {
+            let id = get_positional(sub_args, &[])
+                .ok_or_else(|| RecallError::usage("usage: ndx issue show <id>"))?
+                .parse::<u64>()
+                .map_err(|_| RecallError::usage("issue id must be a positive integer"))?;
+            let palace = Palace::open_from_cwd()?;
+            let drawers = palace.list_drawers(Some(issue::ISSUES_ROOM), usize::MAX, 0)?;
+            let d = drawers
+                .into_iter()
+                .find(|d| d.id == id)
+                .ok_or_else(|| RecallError::constraint(format!("issue {} not found", id)))?;
+            if has_flag(sub_args, "--json") {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                println!("#{}  status={}  importance={}", d.id, issue::drawer_status(&d), d.importance);
+                if let Some(ms) = d.metadata.get(issue::META_MILESTONE) {
+                    println!("milestone: {}", ms);
+                }
+                if let Some(ts) = d.metadata.get(issue::META_CLOSED_AT) {
+                    println!("closed_at: {}", ts);
+                }
+                println!();
+                println!("{}", d.text);
+            }
+            Ok(())
+        }
+
+        Some("close") => {
+            let id = get_positional(sub_args, &["--fix", "--commit", "--link-drawer"])
+                .ok_or_else(|| {
+                    RecallError::usage(
+                        "usage: ndx issue close <id> [--fix S] [--commit C] [--link-drawer N]",
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|_| RecallError::usage("issue id must be a positive integer"))?;
+            let fix = get_flag(sub_args, "--fix");
+            let commit = get_flag(sub_args, "--commit");
+            let link_drawer = get_flag_usize(sub_args, "--link-drawer").map(|n| n as u64);
+            let palace = Palace::open_from_cwd()?;
+            issue::close(
+                &palace,
+                id,
+                issue::CloseOptions {
+                    fix,
+                    commit,
+                    link_drawer,
+                },
+            )?;
+            eprintln!("issue {} closed", id);
+            Ok(())
+        }
+
+        Some("reopen") => {
+            let id = get_positional(sub_args, &[])
+                .ok_or_else(|| RecallError::usage("usage: ndx issue reopen <id>"))?
+                .parse::<u64>()
+                .map_err(|_| RecallError::usage("issue id must be a positive integer"))?;
+            let palace = Palace::open_from_cwd()?;
+            issue::reopen(&palace, id)?;
+            eprintln!("issue {} reopened", id);
+            Ok(())
+        }
+
+        Some("update") => {
+            let id = get_positional(sub_args, &["--milestone", "--importance"])
+                .ok_or_else(|| {
+                    RecallError::usage(
+                        "usage: ndx issue update <id> [--milestone M] [--importance N]",
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|_| RecallError::usage("issue id must be a positive integer"))?;
+            let palace = Palace::open_from_cwd()?;
+
+            // --milestone "" or absence means "leave as is" unless the
+            // flag itself is present; the explicit "" clears it.
+            if let Some(ms) = get_flag(sub_args, "--milestone") {
+                issue::set_milestone(&palace, id, Some(ms))?;
+            }
+            if let Some(imp) = get_flag_usize(sub_args, "--importance") {
+                palace.update_drawer(id, None, Some(imp as u8), None)?;
+            }
+            eprintln!("issue {} updated", id);
+            Ok(())
+        }
+
+        Some("rm") => {
+            let id = get_positional(sub_args, &[])
+                .ok_or_else(|| RecallError::usage("usage: ndx issue rm <id>"))?
+                .parse::<u64>()
+                .map_err(|_| RecallError::usage("issue id must be a positive integer"))?;
+            let palace = Palace::open_from_cwd()?;
+            let removed = palace.delete_drawer(id)?;
+            if removed {
+                eprintln!("issue {} removed", id);
+            } else {
+                eprintln!("issue {} not found", id);
+            }
+            Ok(())
+        }
+
+        Some("milestones") => {
+            let palace = Palace::open_from_cwd()?;
+            let summary = issue::milestone_summary(&palace)?;
+            if has_flag(sub_args, "--json") {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                return Ok(());
+            }
+            if summary.is_empty() {
+                println!("(no issues)");
+                return Ok(());
+            }
+            for m in &summary {
+                println!(
+                    "{:<20} {} open / {} closed",
+                    m.milestone, m.open, m.closed
+                );
+            }
+            Ok(())
+        }
+
+        Some(other) => Err(RecallError::usage(format!(
+            "unknown `ndx issue` subcommand: `{}`. expected: add | list | show | close | reopen | update | rm | milestones",
+            other
+        ))
+        .into()),
+
+        None => {
+            eprintln!("usage: ndx issue <add|list|show|close|reopen|update|rm|milestones> [args]");
+            Ok(())
+        }
+    }
+}
 
 fn cmd_hook() -> Result<()> {
     let mut input = String::new();
@@ -1127,6 +1367,10 @@ fn cmd_recall_status(args: &[String]) -> Result<()> {
         .into_iter()
         .filter(|d| !palace.is_superseded(d.id).unwrap_or(false))
         .count();
+    // Open-issue count (issues live as drawers in `_issues_` keyed by
+    // a `meta["issue.status"]` of "open").
+    let open_issues = recall::issue::list(&palace, recall::issue::StatusFilter::Open, None)?
+        .len();
 
     if json {
         // R-1072: JSON surface always includes both fields. Serialize via
@@ -1143,6 +1387,10 @@ fn cmd_recall_status(args: &[String]) -> Result<()> {
                 "do_not_repeat_count".to_string(),
                 serde_json::Value::Number(dnr_count.into()),
             );
+            obj.insert(
+                "open_issues".to_string(),
+                serde_json::Value::Number(open_issues.into()),
+            );
         }
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -1153,6 +1401,7 @@ fn cmd_recall_status(args: &[String]) -> Result<()> {
     println!("  Rooms:   {}", stats.room_count);
     println!("  Links:   {}", stats.link_count);
     println!("  Do-Not-Repeat: {} rules", dnr_count);
+    println!("  Open issues:   {}", open_issues);
     if let Some(model) = &stats.embedding_model {
         println!("  Embedding model: {}", model);
     } else {
@@ -2064,6 +2313,9 @@ fn dispatch(args: &[String]) -> Result<()> {
 
         // Recall commands (direct palace access)
         Some("recall") => cmd_recall(&args[1..]),
+
+        // Issue tracker (drawers in `_issues_` room with status / milestone meta)
+        Some("issue") => cmd_issue(&args[1..]),
 
         // Cross-reference commands (direct memory + filesystem)
         Some("xref") => cmd_xref(&args[1..]),

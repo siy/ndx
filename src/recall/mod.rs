@@ -15,6 +15,7 @@ pub mod bm25;
 pub mod embed;
 pub mod error;
 pub mod identity;
+pub mod issue;
 pub mod mine;
 pub mod search;
 
@@ -1308,6 +1309,63 @@ impl Palace {
         Ok(drawer)
     }
 
+    /// Apply a patch to a drawer's `metadata` map. Each `(key, value)`
+    /// pair either sets the value (`Some`) or removes the key (`None`).
+    /// Updates `updated_at`. No indexes need touching — `metadata` is
+    /// a plain payload field. Returns the post-patch drawer.
+    pub fn patch_drawer_metadata(
+        &self,
+        id: u64,
+        patch: &[(String, Option<String>)],
+    ) -> Result<Drawer> {
+        let current_bytes: Vec<u8> = {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(DRAWERS)?;
+            let fetched = tbl.get(id)?.map(|v| v.value().to_vec());
+            fetched.ok_or_else(|| {
+                RecallError::constraint(format!("drawer {} not found", id))
+            })?
+        };
+        let mut drawer: Drawer = serde_json::from_slice(&current_bytes)?;
+        for (key, value) in patch {
+            match value {
+                Some(v) => {
+                    drawer.metadata.insert(key.clone(), v.clone());
+                }
+                None => {
+                    drawer.metadata.remove(key);
+                }
+            }
+        }
+        drawer.updated_at = now_unix();
+        let txn = self.db.begin_write()?;
+        {
+            let bytes = serde_json::to_vec(&drawer)?;
+            let mut drawers = txn.open_table(DRAWERS)?;
+            drawers.insert(id, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(drawer)
+    }
+
+    /// Append text to a drawer's existing body. Used by `issue close`
+    /// to attach a structured fix-and-commit trailer without losing
+    /// the original issue body. Updates BM25, content_hash, etc. via
+    /// the existing `update_drawer` plumbing.
+    pub fn append_drawer_text(&self, id: u64, suffix: &str) -> Result<Drawer> {
+        let current_bytes: Vec<u8> = {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(DRAWERS)?;
+            let fetched = tbl.get(id)?.map(|v| v.value().to_vec());
+            fetched.ok_or_else(|| {
+                RecallError::constraint(format!("drawer {} not found", id))
+            })?
+        };
+        let drawer: Drawer = serde_json::from_slice(&current_bytes)?;
+        let combined = format!("{}{}", drawer.text, suffix);
+        self.update_drawer(id, None, None, Some(&combined))
+    }
+
     /// Delete a drawer and cascade across every satellite table:
     /// DRAWER_BY_HASH, DRAWER_EMBEDDINGS, DRAWERS_BY_ROOM, BM25_POSTINGS,
     /// DRAWERS_BY_TOKEN, DRAWER_LENGTHS, BM25_META, FILE_DRAWER_XREF,
@@ -1745,6 +1803,36 @@ impl Palace {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Return every link originating from `from` as `(to, kind)` pairs.
+    /// Mostly used by the issue tracker to verify `derived_from`
+    /// edges, but generic enough to support any caller that needs to
+    /// enumerate a drawer's outbound graph.
+    pub fn outgoing_links(&self, from: u64) -> Result<Vec<(u64, LinkKind)>> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(LINKS)?;
+        let mut out = Vec::new();
+        for entry in tbl.iter()? {
+            let (k, _) = entry?;
+            let key = k.value();
+            if key.len() != 17 {
+                continue;
+            }
+            let f = u64::from_le_bytes([
+                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+            ]);
+            if f != from {
+                continue;
+            }
+            let to = u64::from_le_bytes([
+                key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15],
+            ]);
+            if let Some(kind) = LinkKind::from_tag(key[16]) {
+                out.push((to, kind));
+            }
+        }
+        Ok(out)
     }
 
     /// Return true iff at least one drawer has a Supersedes link pointing

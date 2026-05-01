@@ -258,6 +258,27 @@ ndx xref drawer-session <session-id>    # drawers derived from a session
 ndx xref git <commit>                   # drawers referencing files changed in a commit (cached)
 ```
 
+### Issue tracker
+
+A per-project issue log built on top of drawers. Issues live in the reserved `_issues_` room; their structured state — `status` (open/closed), `closed_at`, `milestone` — is stored under namespaced `issue.*` keys in the drawer's `metadata` map, so tags and other future attributes can be added without schema migrations.
+
+```sh
+ndx issue add "fix the timeout" --body "happens on staging" --milestone v0.9.0 --importance 8
+ndx issue list                                    # default: open
+ndx issue list --status closed --milestone v0.9.0 # filter by status and milestone
+ndx issue list --status all
+ndx issue show <id>
+ndx issue update <id> --milestone v0.10.0         # bulk: change milestone or importance
+ndx issue close <id> --fix "raised timeout to 30s" --commit abc1234 [--link-drawer N]
+ndx issue reopen <id>                             # status → open; close trailer kept as history
+ndx issue rm <id>
+ndx issue milestones                              # group by milestone, show open/closed counts
+```
+
+Closing an issue stamps `issue.closed_at` and appends a structured trailer (`**Closed YYYY-MM-DD** — fix. Commit: sha.`) to the drawer text — fully searchable via BM25/semantic, and `ndx xref git <sha>` picks up the commit reference. The optional `--link-drawer` records a `derived_from` edge from the issue to a rationale drawer (typically the closing session's most recent), preserving the fix narrative. Drawer machinery (search, links, importance, mining, classify/score) all keep working unchanged on issues.
+
+`ndx recall status` shows `Open issues: N`.
+
 ### Daemon commands
 
 ```sh

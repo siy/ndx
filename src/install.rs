@@ -147,6 +147,7 @@ ndx recall identity edit [--project]       # opens $EDITOR on identity.toml
 
 - **`_do_not_repeat_`** — always-loaded wake-up channel. Drawers here render above L1 in every `ndx recall wake` output, regardless of importance, capped by `[wakeup] dnr_cap` in `identity.toml` (default 20). Use for corrections, hard rules, and "never do X again" guidance. Be sparing — the cap exists for a reason.
 - **`_summary_`** — per-room summary drawers produced by `/ndx-recall-summarize`. Surfaces first in L1 wake-up text via importance=10.
+- **`_issues_`** — issue tracker entries managed via `ndx issue ...`. Status (`open`/`closed`), `closed_at`, and `milestone` live in the drawer's `metadata` under `issue.*` keys. Don't classify drawers into this room manually; create issues via the CLI so the metadata is set correctly.
 
 ### Skill-assisted maintenance
 
@@ -171,6 +172,21 @@ ndx xref drawer src/main.rs              # find palace drawers that reference a 
 ndx xref drawer-session <session-id>     # drawers derived from a session
 ndx xref git <commit>                    # drawers referencing files changed in a commit
 ```
+
+## Issue Tracker
+
+```bash
+ndx issue add "title" [--body B] [--milestone M] [--importance N] [--source-file F] [--link-drawer N]
+ndx issue list [--status open|closed|all] [--milestone M]
+ndx issue show <id>
+ndx issue update <id> [--milestone M] [--importance N]
+ndx issue close <id> [--fix S] [--commit C] [--link-drawer N]
+ndx issue reopen <id>
+ndx issue rm <id>
+ndx issue milestones
+```
+
+Issues are drawers in `_issues_` with `meta["issue.status"]` driving filtering. Closing appends a structured trailer to the drawer text (`**Closed YYYY-MM-DD** — fix. Commit: sha.`) — fully searchable. Use `--link-drawer N` on close to attach a `derived_from` link from the issue to a rationale drawer.
 
 ## Maintenance
 
@@ -203,7 +219,7 @@ Work through the current project's recall palace and assign each unclassified dr
    Read each drawer's `text`. Assign the best-fitting room. Prefer existing rooms from `project.existing_rooms` when one fits; create new rooms only when none match.
    Good room names: lowercase, `[a-z0-9_-]+`, ≤64 chars. Examples: `architecture`, `decisions`, `people`, `tools`, `bugs`, `glossary`, `rationale`, `setup`.
 
-   **Reserved room — `_do_not_repeat_`** (always-loaded wake-up channel). Use it for corrections, hard rules, and "never do X again" guidance — drawers placed here are concatenated into every wake-up regardless of importance, capped by `[wakeup] dnr_cap` in `identity.toml` (default 20). Examples that belong in DnR: a user correction about a specific approach to avoid; a deployment constraint that must always hold; a security rule. Examples that do NOT belong in DnR: facts that are already covered by importance-ranked L1 promotion; observations or context. The `_summary_` room is similarly reserved and is populated by `/ndx-recall-summarize`, not by classification.
+   **Reserved room — `_do_not_repeat_`** (always-loaded wake-up channel). Use it for corrections, hard rules, and "never do X again" guidance — drawers placed here are concatenated into every wake-up regardless of importance, capped by `[wakeup] dnr_cap` in `identity.toml` (default 20). Examples that belong in DnR: a user correction about a specific approach to avoid; a deployment constraint that must always hold; a security rule. Examples that do NOT belong in DnR: facts that are already covered by importance-ranked L1 promotion; observations or context. The `_summary_` room is similarly reserved and is populated by `/ndx-recall-summarize`, not by classification. **`_issues_`** is also reserved and managed exclusively via `ndx issue ...`; never classify drawers into it from this skill.
 
 3. **Bulk-classify by source file first**
    Before classifying individual drawers, check if whole-file moves save work:
@@ -508,6 +524,7 @@ Floor rules:
 - If a drawer is genuinely ambiguous, leave it as `unclassified` and move on — do not invent rooms to clear the queue.
 - Re-fetch the batch after bulk moves to see what remains.
 - **`_do_not_repeat_`** is reserved for corrections / hard rules that must always load in wake-up. When a drawer is a clear "never do X again" rule, classify it there. Be sparing — the cap is 20 by default.
+- **`_issues_`** is reserved for the issue tracker (`ndx issue ...`). Don't classify drawers into it from this skill — issues are filed via the CLI so their metadata is set correctly.
 
 Stop: `ndx recall drawer list --pending classify --limit 1 --json` returns an empty `drawers` array.
 
