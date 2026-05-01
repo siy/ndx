@@ -113,7 +113,9 @@ ndx recall wake                                 # L0 identity + L1 top drawers (
 ndx recall get --room decisions --limit 10      # all decisions, ranked by importance
 ```
 
-The PreToolUse hook automatically injects wake-up context (L0 + L1) on the first Bash command of each Claude session — no manual `wake` needed. The PreCompact hook re-injects the same wake-up block whenever Claude compacts its context (manual `/compact` or automatic at the context limit), so palace context survives compaction intact.
+The PreToolUse hook automatically injects wake-up context (L0 + Do-Not-Repeat + L1) on the first Bash command of each Claude session — no manual `wake` needed. The PreCompact hook re-injects the same wake-up block whenever Claude compacts its context (manual `/compact` or automatic at the context limit), so palace context survives compaction intact.
+
+**Do-Not-Repeat channel** — drawers in the reserved `_do_not_repeat_` room render above L1 in every wake-up regardless of importance, capped by `[wakeup] dnr_cap` in `identity.toml` (default 20). Use it for corrections and hard rules ("never use X here", "deployment must always Y"). When the count exceeds the cap, an overflow line points at `/ndx-chore` to consolidate. `ndx recall status` shows the active rule count.
 
 ### 4. Maintain over time
 

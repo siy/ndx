@@ -1119,6 +1119,15 @@ fn cmd_recall_status(args: &[String]) -> Result<()> {
     let palace = Palace::open_from_cwd()?;
     let stats = palace.stats()?;
     let json = args.iter().any(|a| a == "--json");
+
+    // Count active (non-superseded) drawers in the Do-Not-Repeat room
+    // for both surfaces.
+    let dnr_count = palace
+        .list_drawers(Some(recall::search::DNR_ROOM), usize::MAX, 0)?
+        .into_iter()
+        .filter(|d| !palace.is_superseded(d.id).unwrap_or(false))
+        .count();
+
     if json {
         // R-1072: JSON surface always includes both fields. Serialize via
         // serde_json::Value so `palace_linked_to` renders as `null` when
@@ -1130,6 +1139,10 @@ fn cmd_recall_status(args: &[String]) -> Result<()> {
                 .or_insert(serde_json::Value::Null);
             obj.entry("palace_linked_to")
                 .or_insert(serde_json::Value::Null);
+            obj.insert(
+                "do_not_repeat_count".to_string(),
+                serde_json::Value::Number(dnr_count.into()),
+            );
         }
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -1139,6 +1152,7 @@ fn cmd_recall_status(args: &[String]) -> Result<()> {
     println!("  Drawers: {}", stats.drawer_count);
     println!("  Rooms:   {}", stats.room_count);
     println!("  Links:   {}", stats.link_count);
+    println!("  Do-Not-Repeat: {} rules", dnr_count);
     if let Some(model) = &stats.embedding_model {
         println!("  Embedding model: {}", model);
     } else {

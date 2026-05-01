@@ -157,9 +157,38 @@ const L1_MAX_DRAWERS: usize = 15;
 const L1_MAX_CHARS: usize = 3200;
 const L1_SNIPPET_MAX: usize = 200;
 
-/// Generate L0 + L1 wake-up text. Identity is loaded from global +
-/// per-project TOML (R-311..R-313); L1 is computed from the top
-/// importance-ranked drawers of the current palace (R-511..R-514).
+/// Reserved room name for the always-loaded "Do-Not-Repeat" channel
+/// (Batch 4). Drawers in this room are concatenated into wake-up text
+/// regardless of their importance, capped by `[wakeup] dnr_cap` in
+/// `identity.toml` (default `DNR_DEFAULT_CAP`). Matching the existing
+/// `_summary_` precedent for underscore-prefixed reserved rooms.
+pub const DNR_ROOM: &str = "_do_not_repeat_";
+
+/// Default cap on the Do-Not-Repeat block when `[wakeup] dnr_cap` is
+/// absent from the merged identity. Keeps the always-loaded section
+/// from crowding L1 budget on long-running projects.
+pub const DNR_DEFAULT_CAP: usize = 20;
+
+/// Read `[wakeup] dnr_cap` from a merged identity TOML, falling back
+/// to `DNR_DEFAULT_CAP` for missing / wrong-typed entries. Negative
+/// or zero values fall back to the default — a non-positive cap is
+/// almost always a misconfiguration.
+fn dnr_cap_from(merged: Option<&toml::Value>) -> usize {
+    merged
+        .and_then(|v| v.get("wakeup"))
+        .and_then(|v| v.get("dnr_cap"))
+        .and_then(|v| v.as_integer())
+        .filter(|n| *n > 0)
+        .map(|n| n as usize)
+        .unwrap_or(DNR_DEFAULT_CAP)
+}
+
+/// Generate L0 + Do-Not-Repeat + L1 wake-up text. Identity is loaded
+/// from global + per-project TOML (R-311..R-313); the Do-Not-Repeat
+/// channel renders every drawer in `_do_not_repeat_` (capped) above
+/// L1; L1 is computed from the top importance-ranked drawers of the
+/// current palace (R-511..R-514) excluding the DnR room (those are
+/// already shown above).
 pub fn wake_up(palace: &Palace) -> Result<String> {
     let mut out = String::new();
 
@@ -170,9 +199,54 @@ pub fn wake_up(palace: &Palace) -> Result<String> {
 
     out.push('\n');
 
+    // Do-Not-Repeat — always loaded, capped per identity.
+    let cap = dnr_cap_from(merged.as_ref());
+    let dnr = render_dnr(palace, cap)?;
+    if !dnr.is_empty() {
+        out.push_str(&dnr);
+        out.push('\n');
+    }
+
     // L1 — essential story
     out.push_str(&render_l1(palace)?);
 
+    Ok(out)
+}
+
+/// Render the Do-Not-Repeat block. Empty string when the room has no
+/// drawers (so wake-up text doesn't carry a useless empty header).
+/// Drawers are sorted by importance desc, then created-at desc; if
+/// the count exceeds `cap`, an overflow line points at `/ndx-chore`.
+pub fn render_dnr(palace: &Palace, cap: usize) -> Result<String> {
+    let mut drawers = palace.list_drawers(Some(DNR_ROOM), usize::MAX, 0)?;
+    drawers.retain(|d| !palace.is_superseded(d.id).unwrap_or(false));
+
+    if drawers.is_empty() {
+        return Ok(String::new());
+    }
+
+    drawers.sort_by(|a, b| {
+        b.importance
+            .cmp(&a.importance)
+            .then(b.created_at.cmp(&a.created_at))
+    });
+
+    let total = drawers.len();
+    let shown = total.min(cap);
+
+    let mut out = String::from("## DO-NOT-REPEAT\n");
+    for d in drawers.iter().take(shown) {
+        let snippet = compact_snippet(&d.text, L1_SNIPPET_MAX);
+        out.push_str(&format!("  - {}\n", snippet));
+    }
+    if total > shown {
+        let extra = total - shown;
+        let noun = if extra == 1 { "rule" } else { "rules" };
+        out.push_str(&format!(
+            "  _({} more {} in {}; run /ndx-chore to consolidate)_\n",
+            extra, noun, DNR_ROOM
+        ));
+    }
     Ok(out)
 }
 
@@ -245,6 +319,11 @@ fn collect_l1_candidates(palace: &Palace) -> Result<Vec<Drawer>> {
     let all = palace.list_drawers(None, usize::MAX, 0)?;
     let mut out = Vec::with_capacity(all.len());
     for d in all {
+        // Drawers in the Do-Not-Repeat room are rendered above L1;
+        // skip here to avoid showing them twice.
+        if d.room == DNR_ROOM {
+            continue;
+        }
         if palace.is_superseded(d.id)? {
             continue;
         }
@@ -376,5 +455,138 @@ mod tests {
             !out.contains("old position"),
             "superseded drawer should be hidden"
         );
+    }
+
+    // ── Do-Not-Repeat channel ─────────────────────────────────────────
+
+    #[test]
+    fn dnr_empty_room_renders_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        let out = render_dnr(&p, DNR_DEFAULT_CAP).unwrap();
+        assert_eq!(out, "", "empty DnR should render no header at all");
+    }
+
+    #[test]
+    fn dnr_renders_in_importance_desc() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        p.ensure_room(DNR_ROOM, None, None).unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("low rule", 3, DNR_ROOM))
+            .unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("hi rule", 9, DNR_ROOM))
+            .unwrap();
+
+        let out = render_dnr(&p, DNR_DEFAULT_CAP).unwrap();
+        assert!(out.contains("## DO-NOT-REPEAT"));
+        let hi = out.find("hi rule").unwrap();
+        let lo = out.find("low rule").unwrap();
+        assert!(hi < lo, "high importance should render first");
+    }
+
+    #[test]
+    fn dnr_caps_with_overflow_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        p.ensure_room(DNR_ROOM, None, None).unwrap();
+        for i in 0..7u8 {
+            p.insert_drawer_no_embedding(mk_drawer(
+                &format!("rule {}", i),
+                10 - i,
+                DNR_ROOM,
+            ))
+            .unwrap();
+        }
+
+        let out = render_dnr(&p, 3).unwrap();
+        assert!(out.contains("rule 0")); // top 3 by importance
+        assert!(out.contains("rule 1"));
+        assert!(out.contains("rule 2"));
+        assert!(!out.contains("rule 3"), "rule 3 exceeds cap of 3");
+        assert!(
+            out.contains("4 more rules"),
+            "overflow line should mention remaining count, got: {}",
+            out
+        );
+        // Edge case — singular noun for exactly one overflow rule.
+        let out1 = render_dnr(&p, 6).unwrap();
+        assert!(
+            out1.contains("1 more rule") && !out1.contains("1 more rules"),
+            "singular 'rule' should be used when exactly 1 over cap, got: {}",
+            out1
+        );
+        assert!(out.contains(DNR_ROOM));
+        assert!(out.contains("/ndx-chore"));
+    }
+
+    #[test]
+    fn dnr_excluded_from_l1() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        p.ensure_room(DNR_ROOM, None, None).unwrap();
+        p.insert_drawer_no_embedding(mk_drawer("never repeat", 9, DNR_ROOM))
+            .unwrap();
+        p.insert_drawer_no_embedding(mk_drawer(
+            "normal fact",
+            8,
+            UNCLASSIFIED_ROOM,
+        ))
+        .unwrap();
+
+        let l1 = render_l1(&p).unwrap();
+        assert!(l1.contains("normal fact"));
+        assert!(
+            !l1.contains("never repeat"),
+            "DnR drawers should not duplicate into L1"
+        );
+    }
+
+    #[test]
+    fn dnr_skips_superseded() {
+        use crate::recall::LinkKind;
+        let dir = tempfile::tempdir().unwrap();
+        let p = Palace::create_at(dir.path().to_path_buf()).unwrap();
+        p.ensure_room(DNR_ROOM, None, None).unwrap();
+        let old = p
+            .insert_drawer_no_embedding(mk_drawer("old rule", 9, DNR_ROOM))
+            .unwrap();
+        let new_d = p
+            .insert_drawer_no_embedding(mk_drawer("new rule", 9, DNR_ROOM))
+            .unwrap();
+        p.link_drawers(new_d.id, old.id, LinkKind::Supersedes)
+            .unwrap();
+
+        let out = render_dnr(&p, DNR_DEFAULT_CAP).unwrap();
+        assert!(out.contains("new rule"));
+        assert!(!out.contains("old rule"));
+    }
+
+    // ── Cap parsing ───────────────────────────────────────────────────
+
+    #[test]
+    fn dnr_cap_default_when_missing() {
+        assert_eq!(dnr_cap_from(None), DNR_DEFAULT_CAP);
+        let v: toml::Value = toml::from_str("").unwrap();
+        assert_eq!(dnr_cap_from(Some(&v)), DNR_DEFAULT_CAP);
+    }
+
+    #[test]
+    fn dnr_cap_reads_from_wakeup_table() {
+        let v: toml::Value = toml::from_str("[wakeup]\ndnr_cap = 5\n").unwrap();
+        assert_eq!(dnr_cap_from(Some(&v)), 5);
+    }
+
+    #[test]
+    fn dnr_cap_falls_back_on_non_positive() {
+        let v: toml::Value = toml::from_str("[wakeup]\ndnr_cap = 0\n").unwrap();
+        assert_eq!(dnr_cap_from(Some(&v)), DNR_DEFAULT_CAP);
+        let v: toml::Value = toml::from_str("[wakeup]\ndnr_cap = -1\n").unwrap();
+        assert_eq!(dnr_cap_from(Some(&v)), DNR_DEFAULT_CAP);
+    }
+
+    #[test]
+    fn dnr_cap_falls_back_on_wrong_type() {
+        let v: toml::Value = toml::from_str("[wakeup]\ndnr_cap = \"big\"\n").unwrap();
+        assert_eq!(dnr_cap_from(Some(&v)), DNR_DEFAULT_CAP);
     }
 }

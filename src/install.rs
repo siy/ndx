@@ -143,6 +143,11 @@ ndx recall identity show [--merged]
 ndx recall identity edit [--project]       # opens $EDITOR on identity.toml
 ```
 
+### Reserved rooms
+
+- **`_do_not_repeat_`** — always-loaded wake-up channel. Drawers here render above L1 in every `ndx recall wake` output, regardless of importance, capped by `[wakeup] dnr_cap` in `identity.toml` (default 20). Use for corrections, hard rules, and "never do X again" guidance. Be sparing — the cap exists for a reason.
+- **`_summary_`** — per-room summary drawers produced by `/ndx-recall-summarize`. Surfaces first in L1 wake-up text via importance=10.
+
 ### Skill-assisted maintenance
 
 The palace ingests everything raw. Quality (room assignment, importance, deduplication, contradiction flagging, summarization) is curated via slash commands:
@@ -197,6 +202,8 @@ Work through the current project's recall palace and assign each unclassified dr
 2. **Decide the room for each drawer**
    Read each drawer's `text`. Assign the best-fitting room. Prefer existing rooms from `project.existing_rooms` when one fits; create new rooms only when none match.
    Good room names: lowercase, `[a-z0-9_-]+`, ≤64 chars. Examples: `architecture`, `decisions`, `people`, `tools`, `bugs`, `glossary`, `rationale`, `setup`.
+
+   **Reserved room — `_do_not_repeat_`** (always-loaded wake-up channel). Use it for corrections, hard rules, and "never do X again" guidance — drawers placed here are concatenated into every wake-up regardless of importance, capped by `[wakeup] dnr_cap` in `identity.toml` (default 20). Examples that belong in DnR: a user correction about a specific approach to avoid; a deployment constraint that must always hold; a security rule. Examples that do NOT belong in DnR: facts that are already covered by importance-ranked L1 promotion; observations or context. The `_summary_` room is similarly reserved and is populated by `/ndx-recall-summarize`, not by classification.
 
 3. **Bulk-classify by source file first**
    Before classifying individual drawers, check if whole-file moves save work:
@@ -500,6 +507,7 @@ Floor rules:
 - Room names: lowercase, `[a-z0-9_-]+`, ≤64 chars.
 - If a drawer is genuinely ambiguous, leave it as `unclassified` and move on — do not invent rooms to clear the queue.
 - Re-fetch the batch after bulk moves to see what remains.
+- **`_do_not_repeat_`** is reserved for corrections / hard rules that must always load in wake-up. When a drawer is a clear "never do X again" rule, classify it there. Be sparing — the cap is 20 by default.
 
 Stop: `ndx recall drawer list --pending classify --limit 1 --json` returns an empty `drawers` array.
 
